@@ -4,6 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <meta name="theme-color" content="#ffffff">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
 <title>SKU Scanner</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Crect x='6' y='22' width='88' height='56' rx='6' fill='%23ffe14a' stroke='%23d7262e' stroke-width='8'/%3E%3C/svg%3E">
 <style>
@@ -42,6 +46,10 @@ button[hidden]{display:none}
 .check{display:flex;gap:8px;align-items:center;font-size:.9rem;color:var(--muted)}
 .check input{width:20px;height:20px}
 
+input[type=search],textarea{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;margin-top:14px}
+.set{display:flex;gap:10px;align-items:center;margin:8px 0;color:var(--muted)}.set input{flex:1}
+dialog{border:3px solid var(--red);border-radius:6px;width:min(92vw,480px)}
+summary{cursor:pointer;color:var(--muted);margin-top:6px}
 .seg{display:flex;gap:6px;margin:12px 0 0}.seg button{flex:1}.seg button.on{background:var(--band);border-color:var(--red)}
 .listhead{display:flex;align-items:center;justify-content:space-between;margin:22px 0 8px;gap:8px;flex-wrap:wrap}
 .listhead .acts{display:flex;gap:6px}
@@ -84,11 +92,19 @@ pre{white-space:pre-wrap;background:var(--wash);padding:10px;border-radius:8px;m
   <div class="row">
     <button id="startBtn" class="primary">Start camera</button>
     <button id="torchBtn" hidden>Light</button>
+    <button id="photoBtn">Scan a photo</button>
+    <input type="file" id="photoIn" accept="image/*" hidden>
   </div>
+  <details id="settings">
+    <summary>Settings <span id="fps"></span></summary>
+    <label class="set">Confidence <input type="range" id="confR" min="50" max="95" step="1"> <output id="confO"></output></label>
+    <label class="set" id="zoomRow" hidden>Zoom <input type="range" id="zoomR"></label>
+  </details>
 
+  <input id="q" type="search" placeholder="Search SKUs in both lists" aria-label="Search SKUs">
   <div class="listhead">
     <h2>Hunt list <span id="huntCount"></span></h2>
-    <div class="acts"><button id="huntClear">Clear</button></div>
+    <div class="acts"><button id="huntCopy">Copy</button><button id="huntImport">Import</button><button id="huntClear">Clear</button></div>
   </div>
   <ul id="huntList"></ul>
 
@@ -104,9 +120,14 @@ pre{white-space:pre-wrap;background:var(--wash);padding:10px;border-radius:8px;m
 
   <details><summary>What the reader saw</summary><pre id="raw">Nothing yet.</pre></details>
 </main>
+<dialog id="imp">
+  <p>Paste a list, one SKU and price per line, like 1866-265 36.99</p>
+  <textarea id="impTxt" rows="8"></textarea>
+  <div class="row"><button id="impGo" class="primary">Import</button><button id="impNo">Cancel</button></div>
+</dialog>
 
-<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.all.min.js" crossorigin="anonymous"></script>
 <script>
 /*
   SKU Scanner: finds a shelf tag, crops the SKU corner, reads it with OCR.
@@ -121,6 +142,7 @@ const $ = id => document.getElementById(id);
 const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
 const statusEl = $('status'), candEl = $('cand'), footEl = $('foot'), cropPrev = $('crop'), rawEl = $('raw');
 const startBtn = $('startBtn'), torchBtn = $('torchBtn');
+const searchEl = $('q'), photoBtn = $('photoBtn'), photoIn = $('photoIn');
 const listEl = $('list'), countEl = $('count'), huntEl = $('huntList'), huntCount = $('huntCount');
 
 // Where the SKU sits inside the tag, as fractions of the tag box (lower-left corner).
@@ -143,7 +165,7 @@ let worker = null, curPsm = '6', torchOn = false;
 let hist = [], lastAccepted = null, lastTagSeen = 0, lastOcr = 0, flashUntil = 0;
 let scans = [];
 const frame = document.createElement('canvas');
-const frameCtx = frame.getContext('2d', { willReadFrequently: true });
+const frameCtx = frame.getContext('2d');   // GPU canvas: faster to copy video into
 const ocrCv = document.createElement('canvas');
 const det = document.createElement('canvas');
 const detCtx = det.getContext('2d', { willReadFrequently: true });
@@ -153,10 +175,11 @@ function setStatus(s) { if (s !== lastStatus) { statusEl.textContent = s; lastSt
 
 /* ---------- tag detection: YOLO via ONNX Runtime Web ---------- */
 const MODEL_URL = 'best.onnx';   // the exported model, next to index.html
-const MODEL_SIZE = 640;          // imgsz used for training and export
-const CONF_MIN = 0.4;            // lower to find more tags, raise to cut false boxes
+let MODEL_SIZE = 640;            // fixed automatically if the model expects another size
+let CONF_MIN = 0.85;             // only accept detections at 85% or higher (Settings slider)
+try { CONF_MIN = +localStorage.getItem('skuConf') || 0.85; } catch (e) {}
 const TAG_CLASS = null;          // set to a class number to ignore the other classes
-let session = null, inputName = '', detState = 'idle', detPromise = null;
+let inBuf = null, session = null, inputName = '', detState = 'idle', detPromise = null;
 const lb = document.createElement('canvas'); lb.width = lb.height = MODEL_SIZE;
 const lbCtx = lb.getContext('2d', { willReadFrequently: true });
 
@@ -165,8 +188,10 @@ function initDetector() {
   detState = 'loading';
   detPromise = (async () => {
     if (!window.ort) throw new Error('onnxruntime-web did not load');
+    const gpu = !!navigator.gpu;               // WebGPU is much faster when the phone has it
     ort.env.wasm.numThreads = 1;
-    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    ort.env.wasm.proxy = !gpu;                 // otherwise run the model off the main thread
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: gpu ? ['webgpu', 'wasm'] : ['wasm'] });
     inputName = session.inputNames[0];
     detState = 'ready';
   })().catch(e => { detState = 'failed'; console.error('Tag model failed, using the red-border finder', e); });
@@ -181,7 +206,7 @@ async function yoloDetect(src) {
   lbCtx.fillStyle = 'rgb(114,114,114)'; lbCtx.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
   lbCtx.drawImage(src, 0, 0, src.width, src.height, px, py, nw, nh);
   const d = lbCtx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
-  const plane = MODEL_SIZE * MODEL_SIZE, input = new Float32Array(3 * plane);
+  const plane = MODEL_SIZE * MODEL_SIZE, input = inBuf || (inBuf = new Float32Array(3 * plane));
   for (let i = 0, p = 0; i < plane; i++, p += 4) {
     input[i] = d[p] / 255; input[plane + i] = d[p + 1] / 255; input[2 * plane + i] = d[p + 2] / 255;
   }
@@ -230,7 +255,11 @@ async function findTags(src) {
   if (detState === 'loading') return [];
   if (detState === 'ready') {
     try { return (await yoloDetect(src)) || []; }
-    catch (e) { console.error(e); detState = 'failed'; }
+    catch (e) {
+      const m = /Expected: (\d+)/.exec(String((e && e.message) || e));
+      if (m && +m[1] !== MODEL_SIZE) { MODEL_SIZE = +m[1]; lb.width = lb.height = MODEL_SIZE; inBuf = null; return []; }
+      console.error(e); detState = 'failed';
+    }
   }
   const t = detectTag(src);        // model unavailable: red-border finder
   return t ? [t] : [];
@@ -350,8 +379,8 @@ const PARAMS = {
   price: { tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' }
 };
 let curKind = 'sku';
-async function runOcr(tag, kind) {
-  const cv = prepare(frame, tag, kind === 'price' ? PRICE_REGION : REGION);   // copy now; the frame changes
+async function runOcr(tag, kind, src = frame) {
+  const cv = prepare(src, tag, kind === 'price' ? PRICE_REGION : REGION);   // copy now; the frame changes
   if (kind !== curKind) { await worker.setParameters(PARAMS[kind]); curKind = kind; }
   const { data } = await worker.recognize(cv);
   return data.text || '';
@@ -374,7 +403,8 @@ function beep() {
 function ping() { beep(); if (navigator.vibrate) navigator.vibrate(60); }
 
 /* ---------- tracking: each tag keeps its identity between frames ---------- */
-let mode = 'scan', hunt = [], tracks = [], nextId = 1;
+let mode = 'scan', hunt = [], tracks = [], nextId = 1, ms = 0, lastT = Date.now();
+const fpsEl = $('fps');
 const HINT = { scan: 'Scanning tags\u2026', build: 'Hold each new label up to the camera.', find: 'Looking for labels on your list\u2026' };
 
 function iou(a, b) {
@@ -468,7 +498,9 @@ async function tick() {
     if (video.readyState >= 2 && video.videoWidth) {
       if (frame.width !== video.videoWidth) { frame.width = video.videoWidth; frame.height = video.videoHeight; }
       frameCtx.drawImage(video, 0, 0);
-      const boxes = await findTags(frame), now = Date.now();
+      const t0 = Date.now(), boxes = await findTags(frame), now = Date.now();
+      ms = ms ? ms * 0.8 + (now - t0) * 0.2 : now - t0;
+      fpsEl.textContent = '(' + (1000 / Math.max(1, now - lastT)).toFixed(1) + ' fps, ' + Math.round(ms) + ' ms)'; lastT = now;
       updateTracks(boxes, now); draw(now);
       if (detState === 'loading') setStatus('Loading the tag finder\u2026');
       else if (!ready) setStatus('Loading the text reader\u2026');
@@ -512,6 +544,7 @@ async function startCamera() {
       await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
     }
     torchBtn.hidden = !caps.torch;
+    if (caps.zoom) { const z = $('zoomR'); z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1; z.value = caps.zoom.min; $('zoomRow').hidden = false; }
   } catch (e) {}
   $('placeholder').hidden = true;
   running = true; startBtn.textContent = 'Stop camera'; startBtn.disabled = false;
@@ -558,6 +591,7 @@ function render() {
     li.textContent = 'Scanned SKUs will appear here.'; listEl.appendChild(li); return;
   }
   scans.forEach((s, i) => {
+    if (!hit(s.sku)) return;
     const li = document.createElement('li');
     const sku = document.createElement('button'); sku.className = 'sku'; sku.textContent = s.sku;
     sku.title = 'Tap to copy';
@@ -601,6 +635,7 @@ function renderHunt() {
     li.textContent = 'Choose Build list, then scan the new labels.'; huntEl.appendChild(li); return;
   }
   hunt.forEach((h, i) => {
+    if (!hit(h.sku)) return;
     const li = document.createElement('li');
     const b = document.createElement('button'); b.className = 'sku';
     b.textContent = h.sku + '  ' + h.price + (h.done ? '  \u2713' : '');
@@ -618,6 +653,70 @@ document.querySelectorAll('#modes button').forEach(b => b.onclick = () => {
   document.querySelectorAll('#modes button').forEach(x => x.classList.toggle('on', x === b));
   tracks.forEach(t => { t.price = null; t.ph = []; t.tries = 0; });
 });
+
+/* ---------- settings, search, sharing, photo ---------- */
+const confR = $('confR'), confO = $('confO');
+confR.value = Math.round(CONF_MIN * 100); confO.textContent = confR.value + '%';
+confR.oninput = () => {
+  CONF_MIN = confR.value / 100; confO.textContent = confR.value + '%';
+  try { localStorage.setItem('skuConf', CONF_MIN); } catch (e) {}
+};
+$('zoomR').oninput = e => { try { track.applyConstraints({ advanced: [{ zoom: +e.target.value }] }); } catch (x) {} };
+
+function hit(sku) {
+  const d = searchEl.value.replace(/\D/g, '');
+  return !d || sku.replace(/\D/g, '').includes(d);
+}
+searchEl.oninput = () => { render(); renderHunt(); };
+
+$('huntCopy').onclick = async () => {
+  if (!hunt.length) return;
+  const ok = await copyText(hunt.map(h => h.sku + ' ' + h.price).join('\n'));
+  setStatus(ok ? 'Copied ' + hunt.length + ' items' : 'Could not copy.');
+};
+const imp = $('imp');
+$('huntImport').onclick = () => { $('impTxt').value = ''; imp.showModal(); };
+$('impNo').onclick = () => imp.close();
+$('impGo').onclick = () => {
+  let n = 0;
+  for (const line of $('impTxt').value.split(/\n/)) {
+    const m = /(\d{4})\s*-\s*(\d{3})\D+(\d{1,4}\.\d{2})/.exec(line);
+    if (m) { addHunt({ sku: m[1] + '-' + m[2], price: (+m[3]).toFixed(2), done: false }); n++; }
+  }
+  imp.close(); setStatus('Imported ' + n + ' items');
+};
+
+photoBtn.onclick = () => photoIn.click();
+photoIn.onchange = async () => {
+  const file = photoIn.files[0]; photoIn.value = '';
+  if (!file) return;
+  if (running) stopCamera();
+  setStatus('Reading photo\u2026');
+  let n = 0;
+  try {
+    await Promise.all([initOcr(), initDetector()]);
+    if (!ready) return;
+    const img = new Image(); img.src = URL.createObjectURL(file); await img.decode();
+    const k = Math.min(1, 2200 / Math.max(img.naturalWidth, img.naturalHeight));
+    const pc = document.createElement('canvas');
+    pc.width = Math.round(img.naturalWidth * k); pc.height = Math.round(img.naturalHeight * k);
+    pc.getContext('2d').drawImage(img, 0, 0, pc.width, pc.height); URL.revokeObjectURL(img.src);
+    let boxes = await findTags(pc);
+    if (!boxes.length) boxes = await findTags(pc);      // retry once after an automatic model-size fix
+    busy = true;
+    for (const b of boxes) {
+      const t = { ...b };
+      t.sku = parseSku(await runOcr(t, 'sku', pc));
+      if (!t.sku) continue;
+      if (needs(t) === 'price') t.price = parsePrice(await runOcr(t, 'price', pc));
+      settle(t); n++;
+    }
+  } catch (e) { console.error(e); }
+  busy = false;
+  setStatus(n ? 'Read ' + n + (n === 1 ? ' tag' : ' tags') + ' from the photo.' : 'No tags read. Try a closer, sharper photo.');
+};
+
+if ('serviceWorker' in navigator && location.protocol.startsWith('http')) navigator.serviceWorker.register('sw.js').catch(() => {});
 
 load(); loadHunt(); render(); renderHunt();
 })();
