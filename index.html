@@ -49,6 +49,7 @@ button[hidden]{display:none}
 input[type=search],textarea{width:100%;font:inherit;padding:10px;border:1px solid var(--line);border-radius:8px;margin-top:14px}
 .set{display:flex;gap:10px;align-items:center;margin:8px 0;color:var(--muted)}.set input{flex:1}
 dialog{border:3px solid var(--red);border-radius:6px;width:min(92vw,480px)}
+dialog input{width:100%;margin:8px 0 0;padding:10px;border:1px solid var(--line);border-radius:8px;font:inherit}
 summary{cursor:pointer;color:var(--muted);margin-top:6px}
 .seg{display:flex;gap:6px;margin:12px 0 0}.seg button{flex:1}.seg button.on{background:var(--band);border-color:var(--red)}
 .listhead{display:flex;align-items:center;justify-content:space-between;margin:22px 0 8px;gap:8px;flex-wrap:wrap}
@@ -120,6 +121,17 @@ pre{white-space:pre-wrap;background:var(--wash);padding:10px;border-radius:8px;m
 
   <details><summary>What the reader saw</summary><pre id="raw">Nothing yet.</pre></details>
 </main>
+<dialog id="reviewDialog">
+  <p>Review this detected item</p>
+  <label>SKU
+    <input id="reviewSku" type="text" inputmode="numeric" placeholder="1234-567">
+  </label>
+  <label>Price
+    <input id="reviewPrice" type="text" inputmode="decimal" placeholder="36.99">
+  </label>
+  <div class="row"><button id="reviewConfirm" class="primary">Accept</button><button id="reviewIgnore">Skip</button></div>
+</dialog>
+
 <dialog id="imp">
   <p>Paste a list, one SKU and price per line, like 1866-265 36.99</p>
   <textarea id="impTxt" rows="8"></textarea>
@@ -159,8 +171,46 @@ function parseSku(text) {
   return null;
 }
 
+function scoreOcrText(text, kind) {
+  const s = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!s) return 0;
+  const digits = (s.match(/\d/g) || []).length;
+
+  if (kind === 'sku') {
+    const parsed = parseSku(s);
+    if (parsed) {
+      const hasDash = /\d{4}\s*[-\u2013\u2014~]\s*\d{3}/.test(s);
+      const hasSpace = /\d{4}\s+\d{3}/.test(s);
+      return Math.min(0.99, 0.55 + (hasDash ? 0.26 : 0) + (hasSpace ? 0.08 : 0) + Math.min(0.15, digits / 18));
+    }
+    if (/\d{4}/.test(s)) return Math.min(0.7, 0.32 + Math.min(0.25, digits / 20));
+    return Math.min(0.4, digits / 20);
+  }
+
+  const parsed = parsePrice(s);
+  if (parsed) {
+    return Math.min(0.99, 0.62 + Math.min(0.25, digits / 14));
+  }
+  const looksPrice = /(\d+)[.,](\d{1,2})/.test(s) || /\d{3,4}/.test(s);
+  return looksPrice ? Math.min(0.7, 0.28 + Math.min(0.25, digits / 18)) : Math.min(0.3, digits / 20);
+}
+function qualityLabel(score) {
+  if (score == null || Number.isNaN(score)) return '—';
+  return Math.max(0, Math.min(99, Math.round(score * 100))) + '%';
+}
+function getReadThreshold(kind) {
+  return kind === 'sku'
+    ? { accept: 0.78, retry: 0.64 }
+    : { accept: 0.86, retry: 0.72 };
+}
+function getTrackState(t) {
+  if (t && t.rejected) return { label: 'rejected', color: '#d7262e' };
+  if (t && t.sku && (!t.price || t.price)) return { label: 'accepted', color: '#1a9d57' };
+  return { label: 'pending', color: '#ffe14a' };
+}
+
 /* ---------- state ---------- */
-let stream = null, track = null, running = false, busy = false, ready = false, ocrPromise = null;
+let stream = null, track = null, running = false, ready = false, ocrPromise = null;
 let worker = null, curPsm = '6', torchOn = false;
 let hist = [], lastAccepted = null, lastTagSeen = 0, lastOcr = 0, flashUntil = 0;
 let scans = [];
@@ -251,18 +301,56 @@ async function yoloDetect(src) {
   return res;
 }
 
+function mergeBoxes(boxes) {
+  const merged = [];
+  for (const box of boxes) {
+    let added = false;
+    for (const m of merged) {
+      if (iou(m, box) > 0.45) {
+        m.x = Math.min(m.x, box.x); m.y = Math.min(m.y, box.y);
+        m.w = Math.max(m.x + m.w, box.x + box.w) - m.x;
+        m.h = Math.max(m.y + m.h, box.y + box.h) - m.y;
+        m.conf = Math.max(m.conf || 0, box.conf || 0);
+        added = true; break;
+      }
+    }
+    if (!added) merged.push({ ...box });
+  }
+  return merged.sort((a, b) => (b.conf || 0) - (a.conf || 0));
+}
+
+async function detectAtScale(src, scale) {
+  const sw = Math.max(1, Math.round(src.width * scale));
+  const sh = Math.max(1, Math.round(src.height * scale));
+  const c = document.createElement('canvas'); c.width = sw; c.height = sh;
+  const cx = c.getContext('2d', { willReadFrequently: true });
+  cx.drawImage(src, 0, 0, sw, sh);
+  const boxes = await yoloDetect(c);
+  if (!boxes) return [];
+  return boxes.map(b => ({ x: b.x / scale, y: b.y / scale, w: b.w / scale, h: b.h / scale, conf: b.conf || CONF_MIN }));
+}
+
 async function findTags(src) {
   if (detState === 'loading') return [];
   if (detState === 'ready') {
-    try { return (await yoloDetect(src)) || []; }
+    try {
+      const scales = [0.75, 1, 1.45, 1.9];
+      const all = [];
+      for (const s of scales) {
+        const hits = await detectAtScale(src, s);
+        all.push(...hits);
+      }
+      const merged = mergeBoxes(all).filter(b => b.w > 20 && b.h > 20);
+      return merged.slice(0, 12);
+    }
     catch (e) {
       const m = /Expected: (\d+)/.exec(String((e && e.message) || e));
       if (m && +m[1] !== MODEL_SIZE) { MODEL_SIZE = +m[1]; lb.width = lb.height = MODEL_SIZE; inBuf = null; return []; }
       console.error(e); detState = 'failed';
     }
   }
-  const t = detectTag(src);        // model unavailable: red-border finder
-  return t ? [t] : [];
+  const tags = detectTags(src);        // model unavailable: red-border finder
+  return tags;
 }
 
 /* ---------- OCR engine ---------- */
@@ -288,7 +376,7 @@ function initOcr() {
 }
 
 /* ---------- fallback tag detection (red border, no ML) ---------- */
-function detectTag(src) {
+function detectTags(src) {
   const DW = 320, w = DW, h = Math.round(src.height * DW / src.width);
   det.width = w; det.height = h;
   detCtx.drawImage(src, 0, 0, w, h);
@@ -298,7 +386,6 @@ function detectTag(src) {
     const r = d[p], g = d[p + 1], b = d[p + 2];
     if (r > 120 && r - g > 60 && r - b > 50) mask[i] = 1;
   }
-  // grow the mask one pixel so small gaps in the border do not split it
   const m2 = new Uint8Array(n);
   for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
     if (!mask[y * w + x]) continue;
@@ -308,7 +395,7 @@ function detectTag(src) {
     }
   }
   const seen = new Uint8Array(n), stack = new Int32Array(n);
-  let best = null;
+  const boxes = [];
   for (let i = 0; i < n; i++) {
     if (!m2[i] || seen[i]) continue;
     let sp = 0, minX = w, minY = h, maxX = 0, maxY = 0, cnt = 0;
@@ -324,20 +411,17 @@ function detectTag(src) {
       if (y < h - 1 && m2[k + w] && !seen[k + w]) { seen[k + w] = 1; stack[sp++] = k + w; }
     }
     const bw = maxX - minX + 1, bh = maxY - minY + 1, area = bw * bh, ar = bw / bh;
-    if (area < n * 0.04 || ar < 1.25 || ar > 2.8) continue;   // wrong size or shape
-    if (cnt / area > 0.5) continue;                           // solid red object, not a border
-    // a real tag is bright inside
+    if (area < n * 0.04 || ar < 1.25 || ar > 2.8) continue;
+    if (cnt / area > 0.5) continue;
     let sum = 0, c = 0;
     for (let y = minY + 3; y < maxY - 3; y += 3) for (let x = minX + 3; x < maxX - 3; x += 3) {
       const p = (y * w + x) * 4;
       sum += 0.3 * d[p] + 0.59 * d[p + 1] + 0.11 * d[p + 2]; c++;
     }
     if (!c || sum / c < 130) continue;
-    if (!best || area > best.area) best = { area, minX, minY, bw, bh };
+    boxes.push({ x: minX * (src.width / w), y: minY * (src.width / w), w: bw * (src.width / w), h: bh * (src.width / w), conf: 0.9 });
   }
-  if (!best) return null;
-  const s = src.width / w;
-  return { x: best.minX * s, y: best.minY * s, w: best.bw * s, h: best.bh * s };
+  return mergeBoxes(boxes).slice(0, 12);
 }
 
 /* ---------- crop + clean up for OCR ---------- */
@@ -379,11 +463,71 @@ const PARAMS = {
   price: { tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' }
 };
 let curKind = 'sku';
+function stackTrackCrop(track, cv, kind) {
+  if (!track) return cv;
+  if (!track.stacks) track.stacks = { sku: [], price: [] };
+  const stack = track.stacks[kind] || (track.stacks[kind] = []);
+  stack.push(cv);
+  while (stack.length > 5) stack.shift();
+  if (stack.length < 3) return cv;
+
+  const w = cv.width, h = cv.height;
+  const stacked = document.createElement('canvas');
+  stacked.width = w; stacked.height = h;
+  const sctx = stacked.getContext('2d', { willReadFrequently: true });
+  const out = sctx.getImageData(0, 0, w, h);
+  const data = out.data;
+  for (let i = 0; i < data.length; i += 4) {
+    let r = 0, g = 0, b = 0;
+    for (const fr of stack) {
+      const img = fr.getContext('2d', { willReadFrequently: true }).getImageData(0, 0, w, h);
+      const d = img.data;
+      r += d[i]; g += d[i + 1]; b += d[i + 2];
+    }
+    const n = stack.length;
+    data[i] = r / n; data[i + 1] = g / n; data[i + 2] = b / n; data[i + 3] = 255;
+  }
+  sctx.putImageData(out, 0, 0);
+  return stacked;
+}
+
+function enhanceCropForOcr(canvas, factor = 1.2, boost = 1.4) {
+  const out = document.createElement('canvas');
+  const w = Math.max(1, Math.round(canvas.width * factor));
+  const h = Math.max(1, Math.round(canvas.height * factor));
+  out.width = w; out.height = h;
+  const c = out.getContext('2d', { willReadFrequently: true });
+  c.imageSmoothingEnabled = true;
+  c.drawImage(canvas, 0, 0, w, h);
+  const img = c.getImageData(0, 0, w, h);
+  const p = img.data;
+  for (let i = 0; i < p.length; i += 4) {
+    let v = (0.299 * p[i] + 0.587 * p[i + 1] + 0.114 * p[i + 2]);
+    v = Math.max(0, Math.min(255, Math.round(v * boost)));
+    p[i] = v; p[i + 1] = v; p[i + 2] = v; p[i + 3] = 255;
+  }
+  c.putImageData(img, 0, 0);
+  return out;
+}
+
 async function runOcr(tag, kind, src = frame) {
-  const cv = prepare(src, tag, kind === 'price' ? PRICE_REGION : REGION);   // copy now; the frame changes
+  const base = prepare(src, tag, kind === 'price' ? PRICE_REGION : REGION);   // copy now; the frame changes
+  const stacked = stackTrackCrop(tag, base, kind);
+  const variants = [stacked, enhanceCropForOcr(stacked, 1.15, 1.35), enhanceCropForOcr(stacked, 1.35, 1.55)];
   if (kind !== curKind) { await worker.setParameters(PARAMS[kind]); curKind = kind; }
-  const { data } = await worker.recognize(cv);
-  return data.text || '';
+
+  let bestText = '', bestScore = -1;
+  for (const variant of variants) {
+    const { data } = await worker.recognize(variant);
+    const text = (data.text || '').trim();
+    const parsed = kind === 'sku' ? parseSku(text) : parsePrice(text);
+    const digits = (text.match(/\d/g) || []).length;
+    const score = parsed ? 10 + digits : Math.max(0, digits - 2);
+    if (score > bestScore || (!bestText && text)) {
+      bestScore = score; bestText = text;
+    }
+  }
+  return bestText;
 }
 function parsePrice(t) {
   const m = /(\d{1,4})\.(\d{2})(?!\d)/.exec(t.replace(/\s/g, ''));
@@ -403,9 +547,71 @@ function beep() {
 function ping() { beep(); if (navigator.vibrate) navigator.vibrate(60); }
 
 /* ---------- tracking: each tag keeps its identity between frames ---------- */
-let mode = 'scan', hunt = [], tracks = [], nextId = 1, ms = 0, lastT = Date.now();
+let mode = 'scan', hunt = [], tracks = [], nextId = 1, ms = 0, lastT = Date.now(), lastCameraTune = 0;
+const reviewDialog = $('reviewDialog'), reviewSku = $('reviewSku'), reviewPrice = $('reviewPrice');
+const reviewConfirm = $('reviewConfirm'), reviewIgnore = $('reviewIgnore');
 const fpsEl = $('fps');
-const HINT = { scan: 'Scanning tags\u2026', build: 'Hold each new label up to the camera.', find: 'Looking for labels on your list\u2026' };
+const HINT = { scan: 'Scanning tags…', build: 'Hold each new label up to the camera.', find: 'Looking for labels on your list…' };
+let reviewQueue = [];
+
+function normalizeSku(value) {
+  const s = String(value || '').trim();
+  const m = s.match(/\d{4}\s*[-\u2013\u2014~]?\s*\d{3}/);
+  if (!m) return null;
+  const digits = m[0].replace(/\D/g, '');
+  if (digits.length !== 7) return null;
+  return digits.slice(0, 4) + '-' + digits.slice(4);
+}
+
+function enqueueReview(item) {
+  if (!item || !item.sku) return;
+  const sku = normalizeSku(item.sku);
+  if (!sku) return;
+  const price = item.price ? String(item.price).trim() : '';
+  if (reviewQueue.some(r => r.sku === sku && r.price === price)) return;
+  reviewQueue.push({ sku, price, source: mode });
+  showReview();
+}
+
+function showReview() {
+  if (!reviewQueue.length) {
+    reviewDialog.close?.();
+    return;
+  }
+  const item = reviewQueue[0];
+  reviewSku.value = item.sku || '';
+  reviewPrice.value = item.price || '';
+  if (!reviewDialog.open) reviewDialog.showModal();
+  setStatus('Reviewing a low-confidence read');
+}
+
+function acceptReview() {
+  const sku = normalizeSku(reviewSku.value);
+  const priceText = String(reviewPrice.value || '').trim();
+  const price = parsePrice(priceText) || (priceText ? priceText : null);
+  if (!sku) {
+    setStatus('Enter a valid SKU like 1234-567');
+    return;
+  }
+  reviewQueue.shift();
+  if (mode === 'scan') addScan(sku);
+  if (mode === 'build' && price) addHunt({ sku, price, done: false });
+  if (mode === 'find' && price) {
+    const same = hunt.find(h => h.sku === sku);
+    if (same && +same.price === +price) { same.done = true; saveHunt(); renderHunt(); }
+  }
+  setStatus('Accepted ' + sku + (price ? ' · ' + price : ''));
+  if (reviewQueue.length) showReview(); else reviewDialog.close();
+}
+
+function skipReview() {
+  reviewQueue.shift();
+  if (reviewQueue.length) showReview(); else reviewDialog.close();
+}
+
+reviewConfirm.onclick = acceptReview;
+reviewIgnore.onclick = skipReview;
+reviewDialog.addEventListener('cancel', (event) => { event.preventDefault(); skipReview(); });
 
 function iou(a, b) {
   const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
@@ -413,13 +619,29 @@ function iou(a, b) {
   const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
   return i / (a.w * a.h + b.w * b.h - i);
 }
+function associationScore(track, box) {
+  const overlap = iou(track, box);
+  const dx = Math.abs((track.x + track.w / 2) - (box.x + box.w / 2));
+  const dy = Math.abs((track.y + track.h / 2) - (box.y + box.h / 2));
+  const centerMax = Math.max(track.w, track.h, box.w, box.h, 1);
+  const centerPenalty = Math.min(1, Math.hypot(dx, dy) / centerMax);
+  const sizeDelta = Math.abs(track.w * track.h - box.w * box.h) / Math.max(track.w * track.h, box.w * box.h, 1);
+  return overlap * 0.7 + (1 - centerPenalty) * 0.2 + (1 - Math.min(1, sizeDelta)) * 0.1;
+}
 function updateTracks(boxes, now) {
   const free = new Set(tracks);
   for (const b of boxes) {
-    let best = null, bi = 0.3;
-    for (const t of free) { const v = iou(t, b); if (v > bi) { bi = v; best = t; } }
-    if (best) { free.delete(best); Object.assign(best, { x: b.x, y: b.y, w: b.w, h: b.h, seen: now }); }
-    else tracks.push({ id: nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, tries: 0, sh: [], ph: [], sku: null, price: null });
+    let best = null, bestScore = 0.18;
+    for (const t of free) {
+      const score = associationScore(t, b);
+      if (score > bestScore) { best = t; bestScore = score; }
+    }
+    if (best) {
+      free.delete(best);
+      Object.assign(best, { x: b.x, y: b.y, w: b.w, h: b.h, seen: now, pending: false });
+    } else {
+      tracks.push({ id: nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, tries: 0, pending: false, qualityPasses: 0, qualityRetry: false, qualityRetryAt: 0, sh: [], ph: [], sku: null, price: null, stacks: { sku: [], price: [] } });
+    }
   }
   tracks = tracks.filter(t => now - t.seen < 800);
 }
@@ -430,31 +652,78 @@ function needs(t) {
   if (!t.price && (mode === 'build' || (mode === 'find' && hunt.some(h => h.sku === t.sku)))) return 'price';
   return null;
 }
-function pickJob(now) {
-  let best = null;
+function priorityScore(t, k) {
+  let s = 0;
+  if (t.qualityRetry) s += 45;
+  if (k === 'sku' && !t.sku) s += 30;
+  if (k === 'price' && t.sku && !t.price) s += 25;
+  if (mode === 'build' && k === 'price') s += 15;
+  if (mode === 'find' && hunt.some(h => h.sku === t.sku)) s += 20;
+  s += Math.min(20, (t.w * t.h) / 2000);
+  s -= t.tries * 1.5;
+  return s;
+}
+function queueReads(now) {
+  const jobs = [];
   for (const t of tracks) {
     const k = needs(t);
-    if (!k || t.seen !== now || t.tries >= 10) continue;
-    if (!best || t.tries < best.t.tries || (t.tries === best.t.tries && t.w * t.h > best.t.w * best.t.h)) best = { t, k };
+    if (!k || t.pending || t.seen !== now || t.tries >= 10) continue;
+    if (t.qualityRetry && Date.now() < (t.qualityRetryAt || 0)) continue;
+    jobs.push({ t, k });
   }
-  return best;
+  jobs.sort((a, b) => priorityScore(b.t, b.k) - priorityScore(a.t, a.k) || b.t.w * b.t.h - a.t.w * a.t.h);
+  return jobs.slice(0, 4);
 }
 function onRead(t, k, text) {
+  t.pending = false;
   t.tries++;
+  const score = scoreOcrText(text, k);
   rawEl.textContent = text.trim() || '(no text)';
   const v = k === 'sku' ? parseSku(text) : parsePrice(text);
   const h = k === 'sku' ? t.sh : t.ph;
   h.push(v); if (h.length > 3) h.shift();
   const n = h.length;
-  if (v && n >= 2 && h[n - 2] === v) {          // two reads in a row agree
+  t.lastScore = score;
+
+  const threshold = getReadThreshold(k);
+  if ((!v || score < threshold.retry) && (t.qualityPasses || 0) < 2) {
+    t.qualityRetry = true;
+    t.qualityRetryAt = Date.now() + 180;
+    t.qualityPasses = (t.qualityPasses || 0) + 1;
+    t.state = 'pending';
+    footEl.textContent = 'Quality pass ' + (t.qualityPasses) + '/2 · Re-reading label';
+    return;
+  }
+
+  t.qualityRetry = false;
+  t.qualityRetryAt = 0;
+  t.qualityPasses = 0;
+  if (v && n >= 2 && h[n - 2] === v && score >= threshold.accept) {
+    t.rejected = false;
     if (k === 'sku') { t.sku = v; t.tries = 0; } else t.price = v;
+    t.state = 'accepted';
     settle(t);
+    return;
+  }
+
+  if (!v || score < threshold.accept) {
+    t.rejected = true;
+    t.state = 'rejected';
+    footEl.textContent = 'Rejected low-quality read · re-checking label';
+    return;
   }
 }
 function settle(t) {
   const hu = hunt.find(h => h.sku === t.sku);
   candEl.textContent = t.sku + (t.price ? '  ' + t.price : ''); candEl.classList.add('ok');
-  footEl.textContent = mode === 'find' ? (hu ? 'On your list' : 'Not on your list') : 'Read';
+  const base = t.lastScore != null ? 'Confidence ' + qualityLabel(t.lastScore) : 'Read';
+  const lowConfidence = typeof t.lastScore === 'number' && t.lastScore < 0.82;
+  if (lowConfidence) {
+    enqueueReview({ sku: t.sku, price: t.price || '' });
+    footEl.textContent = 'Low-confidence read queued for review';
+    return;
+  }
+  footEl.textContent = mode === 'find' ? (hu ? base + ' · On your list' : base + ' · Not on your list') : base;
   if (mode === 'scan' && !scans.some(s => s.sku === t.sku)) { addScan(t.sku); ping(); }
   if (mode === 'build' && t.price) { addHunt({ sku: t.sku, price: t.price, done: false }); ping(); }
   if (mode === 'find' && hu && t.price && +t.price === +hu.price && !hu.done) { hu.done = true; saveHunt(); renderHunt(); ping(); }
@@ -462,16 +731,16 @@ function settle(t) {
 
 /* ---------- box labels ---------- */
 function labelFor(t) {
-  if (!t.sku) return { text: '\u2026', col: '#9aa4b2', dark: true };
+  if (!t.sku) return { text: '\u2026', col: '#9aa4b2', dark: true, state: getTrackState(t) };
   const hu = hunt.find(h => h.sku === t.sku);
-  if (mode === 'build') return { text: t.sku + (t.price ? '  ' + t.price : ' \u2026'), col: t.price ? '#1a9d57' : '#ffe14a', dark: !t.price };
+  if (mode === 'build') return { text: t.sku + (t.price ? '  ' + t.price : ' \u2026'), col: t.price ? '#1a9d57' : '#ffe14a', dark: !t.price, state: getTrackState(t) };
   if (mode === 'find') {
-    if (!hu) return { text: t.sku, col: '#9aa4b2', dark: true };
-    if (!t.price) return { text: t.sku + ' \u2026', col: '#ffe14a', dark: true };
-    return +t.price === +hu.price ? { text: t.sku + '  done \u2713', col: '#1a9d57' }
-      : { text: t.sku + '  SWAP ' + t.price + '\u2192' + hu.price, col: '#d7262e' };
+    if (!hu) return { text: t.sku, col: '#9aa4b2', dark: true, state: getTrackState(t) };
+    if (!t.price) return { text: t.sku + ' \u2026', col: '#ffe14a', dark: true, state: getTrackState(t) };
+    return +t.price === +hu.price ? { text: t.sku + '  done \u2713', col: '#1a9d57', dark: false, state: getTrackState(t) }
+      : { text: t.sku + '  SWAP ' + t.price + '\u2192' + hu.price, col: '#d7262e', dark: false, state: getTrackState(t) };
   }
-  return { text: t.sku, col: '#1a9d57' };
+  return { text: t.sku, col: '#1a9d57', dark: false, state: getTrackState(t) };
 }
 function draw(now) {
   if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight) {
@@ -483,11 +752,27 @@ function draw(now) {
   for (const t of tracks) {
     if (now - t.seen > 300) continue;
     const L = labelFor(t);
+    const state = L.state || { label: 'pending', color: '#ffe14a' };
     octx.lineWidth = lw; octx.strokeStyle = L.col; octx.strokeRect(t.x, t.y, t.w, t.h);
     const tw = octx.measureText(L.text).width + 12, ty = t.y > fs + 8 ? t.y : t.y + t.h + fs + 8;
+    const badgeW = 84; const badgeH = 14; const barW = 60; const barH = 5;
+    const badgeX = t.x + tw + 10;
     octx.fillStyle = L.col; octx.fillRect(t.x, ty - fs - 8, tw, fs + 8);
-    octx.fillStyle = L.dark ? '#1d2530' : '#ffffff';
-    octx.fillText(L.text, t.x + 6, ty - 4);
+    octx.fillStyle = '#1d2530'; octx.fillText(L.text, t.x + 6, ty - 4);
+
+    const score = typeof t.lastScore === 'number' ? Math.max(0, Math.min(1, t.lastScore)) : 0.5;
+    octx.fillStyle = '#ffffff';
+    octx.fillRect(badgeX, ty - fs - 8 + 3, badgeW, badgeH);
+    octx.fillStyle = state.color;
+    octx.fillRect(badgeX + 2, ty - fs - 8 + 5, badgeW - 4, 8);
+    octx.fillStyle = '#1d2530';
+    octx.fillText(state.label.toUpperCase(), badgeX + 6, ty - fs - 8 + 13);
+
+    const barX = badgeX + 2; const barY = ty - fs - 8 + 18;
+    octx.fillStyle = '#e9edf3'; octx.fillRect(barX, barY, barW, barH);
+    octx.fillStyle = state.color; octx.fillRect(barX, barY, Math.max(6, barW * score), barH);
+    octx.fillStyle = '#1d2530';
+    octx.fillText(qualityLabel(score), barX + barW + 8, barY + 4);
   }
 }
 
@@ -506,15 +791,32 @@ async function tick() {
       else if (!ready) setStatus('Loading the text reader\u2026');
       else {
         setStatus(boxes.length ? HINT[mode] : 'Looking for a tag\u2026');
-        const job = busy ? null : pickJob(now);
-        if (job) {
-          busy = true;
-          runOcr(job.t, job.k).then(x => onRead(job.t, job.k, x)).catch(e => console.error(e)).finally(() => { busy = false; });
+        const jobs = queueReads(now);
+        for (const job of jobs) {
+          job.t.pending = true;
+          runOcr(job.t, job.k).then(x => onRead(job.t, job.k, x)).catch(e => console.error(e));
         }
       }
+      if (Date.now() - lastCameraTune > 5000) { lastCameraTune = Date.now(); tuneCamera(); }
     }
   } catch (e) { console.error(e); }
   setTimeout(tick, 60);
+}
+
+async function tuneCamera() {
+  if (!track) return;
+  try {
+    const caps = track.getCapabilities ? track.getCapabilities() : {};
+    const adv = [];
+    if (caps.focusMode && caps.focusMode.includes('continuous')) adv.push({ focusMode: 'continuous' });
+    if (caps.exposureMode && caps.exposureMode.includes('continuous')) adv.push({ exposureMode: 'continuous' });
+    if (caps.whiteBalanceMode && caps.whiteBalanceMode.includes('continuous')) adv.push({ whiteBalanceMode: 'continuous' });
+    if (adv.length) await track.applyConstraints({ advanced: adv });
+    if (caps.exposureCompensation) {
+      const current = caps.exposureCompensation.default ?? 0;
+      await track.applyConstraints({ advanced: [{ exposureCompensation: current }] });
+    }
+  } catch (e) {}
 }
 
 async function startCamera() {
@@ -545,6 +847,7 @@ async function startCamera() {
     }
     torchBtn.hidden = !caps.torch;
     if (caps.zoom) { const z = $('zoomR'); z.min = caps.zoom.min; z.max = caps.zoom.max; z.step = caps.zoom.step || 0.1; z.value = caps.zoom.min; $('zoomRow').hidden = false; }
+    await tuneCamera();
   } catch (e) {}
   $('placeholder').hidden = true;
   running = true; startBtn.textContent = 'Stop camera'; startBtn.disabled = false;
