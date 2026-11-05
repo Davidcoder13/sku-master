@@ -42,6 +42,7 @@ button[hidden]{display:none}
 .check{display:flex;gap:8px;align-items:center;font-size:.9rem;color:var(--muted)}
 .check input{width:20px;height:20px}
 
+.seg{display:flex;gap:6px;margin:12px 0 0}.seg button{flex:1}.seg button.on{background:var(--band);border-color:var(--red)}
 .listhead{display:flex;align-items:center;justify-content:space-between;margin:22px 0 8px;gap:8px;flex-wrap:wrap}
 .listhead .acts{display:flex;gap:6px}
 .listhead button{padding:7px 12px;min-height:38px;font-size:.9rem}
@@ -75,13 +76,21 @@ pre{white-space:pre-wrap;background:var(--wash);padding:10px;border-radius:8px;m
     <div class="foot" id="foot">Waiting for a tag</div>
   </section>
 
+  <div class="seg" id="modes">
+    <button data-mode="scan" class="on">Scan</button>
+    <button data-mode="build">Build list</button>
+    <button data-mode="find">Find</button>
+  </div>
   <div class="row">
     <button id="startBtn" class="primary">Start camera</button>
     <button id="torchBtn" hidden>Light</button>
-    <button id="photoBtn">Scan a photo</button>
-    <input type="file" id="photoIn" accept="image/*" hidden>
   </div>
-  <label class="check"><input type="checkbox" id="wholeChk"> Read the whole frame (use if the tag box is not found)</label>
+
+  <div class="listhead">
+    <h2>Hunt list <span id="huntCount"></span></h2>
+    <div class="acts"><button id="huntClear">Clear</button></div>
+  </div>
+  <ul id="huntList"></ul>
 
   <div class="listhead">
     <h2>Scans <span id="count"></span></h2>
@@ -97,21 +106,22 @@ pre{white-space:pre-wrap;background:var(--wash);padding:10px;border-radius:8px;m
 </main>
 
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
 <script>
 /*
   SKU Scanner: finds a shelf tag, crops the SKU corner, reads it with OCR.
 
-  To use a YOLO model later, replace detectTag(). It receives the full-resolution
-  frame canvas and must return {x, y, w, h} in that canvas's pixels (or null).
-  Everything else (crop, OCR, voting, list) stays the same.
+  The tag is found by a YOLO model (best.onnx, run with ONNX Runtime Web). If the
+  model is missing or fails to load, the older red-border finder is used instead.
+  findTags() returns a list of {x, y, w, h} boxes in full-frame pixels.
 */
 (() => {
 'use strict';
 const $ = id => document.getElementById(id);
 const video = $('video'), overlay = $('overlay'), octx = overlay.getContext('2d');
 const statusEl = $('status'), candEl = $('cand'), footEl = $('foot'), cropPrev = $('crop'), rawEl = $('raw');
-const startBtn = $('startBtn'), torchBtn = $('torchBtn'), photoBtn = $('photoBtn'), photoIn = $('photoIn');
-const wholeChk = $('wholeChk'), listEl = $('list'), countEl = $('count');
+const startBtn = $('startBtn'), torchBtn = $('torchBtn');
+const listEl = $('list'), countEl = $('count'), huntEl = $('huntList'), huntCount = $('huntCount');
 
 // Where the SKU sits inside the tag, as fractions of the tag box (lower-left corner).
 const REGION = { x0: 0.00, x1: 0.52, y0: 0.62, y1: 1.00 };
@@ -141,6 +151,91 @@ const detCtx = det.getContext('2d', { willReadFrequently: true });
 let lastStatus = '';
 function setStatus(s) { if (s !== lastStatus) { statusEl.textContent = s; lastStatus = s; } }
 
+/* ---------- tag detection: YOLO via ONNX Runtime Web ---------- */
+const MODEL_URL = 'best.onnx';   // the exported model, next to index.html
+const MODEL_SIZE = 640;          // imgsz used for training and export
+const CONF_MIN = 0.4;            // lower to find more tags, raise to cut false boxes
+const TAG_CLASS = null;          // set to a class number to ignore the other classes
+let session = null, inputName = '', detState = 'idle', detPromise = null;
+const lb = document.createElement('canvas'); lb.width = lb.height = MODEL_SIZE;
+const lbCtx = lb.getContext('2d', { willReadFrequently: true });
+
+function initDetector() {
+  if (detPromise) return detPromise;
+  detState = 'loading';
+  detPromise = (async () => {
+    if (!window.ort) throw new Error('onnxruntime-web did not load');
+    ort.env.wasm.numThreads = 1;
+    session = await ort.InferenceSession.create(MODEL_URL, { executionProviders: ['wasm'] });
+    inputName = session.inputNames[0];
+    detState = 'ready';
+  })().catch(e => { detState = 'failed'; console.error('Tag model failed, using the red-border finder', e); });
+  return detPromise;
+}
+
+async function yoloDetect(src) {
+  // letterbox the frame into a square, like Ultralytics does
+  const r = Math.min(MODEL_SIZE / src.width, MODEL_SIZE / src.height);
+  const nw = Math.round(src.width * r), nh = Math.round(src.height * r);
+  const px = Math.floor((MODEL_SIZE - nw) / 2), py = Math.floor((MODEL_SIZE - nh) / 2);
+  lbCtx.fillStyle = 'rgb(114,114,114)'; lbCtx.fillRect(0, 0, MODEL_SIZE, MODEL_SIZE);
+  lbCtx.drawImage(src, 0, 0, src.width, src.height, px, py, nw, nh);
+  const d = lbCtx.getImageData(0, 0, MODEL_SIZE, MODEL_SIZE).data;
+  const plane = MODEL_SIZE * MODEL_SIZE, input = new Float32Array(3 * plane);
+  for (let i = 0, p = 0; i < plane; i++, p += 4) {
+    input[i] = d[p] / 255; input[plane + i] = d[p + 1] / 255; input[2 * plane + i] = d[p + 2] / 255;
+  }
+  const out = await session.run({ [inputName]: new ort.Tensor('float32', input, [1, 3, MODEL_SIZE, MODEL_SIZE]) });
+  const t = out[session.outputNames[0]], a = t.data, dims = t.dims;
+
+  const cand = [];
+  const consider = (x1, y1, x2, y2, conf, cls) => {
+    if (conf < CONF_MIN || x2 <= x1 || y2 <= y1) return;
+    if (TAG_CLASS !== null && cls !== TAG_CLASS) return;
+    cand.push({ x1, y1, x2, y2, conf });
+  };
+  if (dims.length === 3 && dims[2] === 6 && dims[1] > 6) {
+    // end-to-end output [1, 300, 6]: x1, y1, x2, y2, confidence, class (no NMS needed)
+    for (let i = 0; i < dims[1]; i++) {
+      const o = i * 6;
+      consider(a[o], a[o + 1], a[o + 2], a[o + 3], a[o + 4], Math.round(a[o + 5]));
+    }
+  } else if (dims.length === 3) {
+    // raw output [1, 4 + classes, boxes]: cx, cy, w, h, then one score per class
+    const rowsFirst = dims[1] > dims[2];
+    const nCh = rowsFirst ? dims[2] : dims[1], n = rowsFirst ? dims[1] : dims[2];
+    const v = (c, i) => rowsFirst ? a[i * nCh + c] : a[c * n + i];
+    for (let i = 0; i < n; i++) {
+      let cls = 0, sc = 0;
+      for (let c = 4; c < nCh; c++) { const s = v(c, i); if (s > sc) { sc = s; cls = c - 4; } }
+      const cx = v(0, i), cy = v(1, i), w = v(2, i), h = v(3, i);
+      consider(cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2, sc, cls);
+    }
+  } else return null;
+  // back to full-frame pixels, strongest first, dropping overlapping duplicates
+  cand.sort((a, b) => b.conf - a.conf);
+  const res = [];
+  for (const c of cand) {
+    const x1 = Math.max(0, (c.x1 - px) / r), y1 = Math.max(0, (c.y1 - py) / r);
+    const x2 = Math.min(src.width, (c.x2 - px) / r), y2 = Math.min(src.height, (c.y2 - py) / r);
+    const b = { x: x1, y: y1, w: x2 - x1, h: y2 - y1 };
+    if (b.w < 20 || b.h < 20 || res.some(o => iou(o, b) > 0.5)) continue;
+    res.push(b);
+    if (res.length >= 12) break;
+  }
+  return res;
+}
+
+async function findTags(src) {
+  if (detState === 'loading') return [];
+  if (detState === 'ready') {
+    try { return (await yoloDetect(src)) || []; }
+    catch (e) { console.error(e); detState = 'failed'; }
+  }
+  const t = detectTag(src);        // model unavailable: red-border finder
+  return t ? [t] : [];
+}
+
 /* ---------- OCR engine ---------- */
 function initOcr() {
   if (ocrPromise) return ocrPromise;
@@ -163,7 +258,7 @@ function initOcr() {
   return ocrPromise;
 }
 
-/* ---------- tag detection (red border, no ML) ---------- */
+/* ---------- fallback tag detection (red border, no ML) ---------- */
 function detectTag(src) {
   const DW = 320, w = DW, h = Math.round(src.height * DW / src.width);
   det.width = w; det.height = h;
@@ -217,14 +312,10 @@ function detectTag(src) {
 }
 
 /* ---------- crop + clean up for OCR ---------- */
-function prepare(src, tag, whole) {
-  let x, y, w, h;
-  if (whole) { x = 0; y = 0; w = src.width; h = src.height; }
-  else {
-    x = tag.x + tag.w * REGION.x0; y = tag.y + tag.h * REGION.y0;
-    w = tag.w * (REGION.x1 - REGION.x0); h = tag.h * (REGION.y1 - REGION.y0);
-  }
-  const target = whole ? 1280 : 800;
+function prepare(src, tag, reg) {
+  const x = tag.x + tag.w * reg.x0, y = tag.y + tag.h * reg.y0;
+  const w = tag.w * (reg.x1 - reg.x0), h = tag.h * (reg.y1 - reg.y0);
+  const target = 800;
   const sc = Math.min(2.5, Math.max(0.4, target / w));
   ocrCv.width = Math.max(1, Math.round(w * sc));
   ocrCv.height = Math.max(1, Math.round(h * sc));
@@ -253,36 +344,21 @@ function prepare(src, tag, whole) {
   return ocrCv;
 }
 
-async function runOcr(tag, whole) {
-  const cv = prepare(frame, tag, whole);          // copy now; the frame changes while we wait
-  const psm = whole ? '11' : '6';
-  if (psm !== curPsm) { await worker.setParameters({ tessedit_pageseg_mode: psm }); curPsm = psm; }
+const PRICE_REGION = { x0: 0.28, x1: 0.88, y0: 0.38, y1: 0.72 };
+const PARAMS = {
+  sku:   { tessedit_char_whitelist: '0123456789-', tessedit_pageseg_mode: '6' },
+  price: { tessedit_char_whitelist: '0123456789.', tessedit_pageseg_mode: '7' }
+};
+let curKind = 'sku';
+async function runOcr(tag, kind) {
+  const cv = prepare(frame, tag, kind === 'price' ? PRICE_REGION : REGION);   // copy now; the frame changes
+  if (kind !== curKind) { await worker.setParameters(PARAMS[kind]); curKind = kind; }
   const { data } = await worker.recognize(cv);
   return data.text || '';
 }
-
-/* ---------- results ---------- */
-function onText(text) {
-  rawEl.textContent = text.trim() || '(no text)';
-  const sku = parseSku(text);
-  hist.push(sku); if (hist.length > 3) hist.shift();
-  const n = hist.length;
-  if (sku) {
-    candEl.textContent = sku; candEl.classList.remove('ok');
-    footEl.textContent = 'Confirming\u2026';
-    if (n >= 2 && hist[n - 2] === sku && sku !== lastAccepted) accept(sku);
-  } else if (Date.now() > flashUntil) {
-    footEl.textContent = 'Tag found, no SKU read yet';
-  }
-}
-
-function accept(sku) {
-  lastAccepted = sku;
-  addScan(sku);
-  candEl.textContent = sku; candEl.classList.add('ok');
-  footEl.textContent = 'Saved to the list';
-  flashUntil = Date.now() + 1200;
-  beep(); if (navigator.vibrate) navigator.vibrate(60);
+function parsePrice(t) {
+  const m = /(\d{1,4})\.(\d{2})(?!\d)/.exec(t.replace(/\s/g, ''));
+  return m ? (+m[1] + +m[2] / 100).toFixed(2) : null;
 }
 
 let actx;
@@ -295,56 +371,118 @@ function beep() {
     o.start(); o.stop(actx.currentTime + 0.12);
   } catch (e) {}
 }
+function ping() { beep(); if (navigator.vibrate) navigator.vibrate(60); }
 
-/* ---------- live camera loop ---------- */
-function drawOverlay(tag, whole) {
+/* ---------- tracking: each tag keeps its identity between frames ---------- */
+let mode = 'scan', hunt = [], tracks = [], nextId = 1;
+const HINT = { scan: 'Scanning tags\u2026', build: 'Hold each new label up to the camera.', find: 'Looking for labels on your list\u2026' };
+
+function iou(a, b) {
+  const x1 = Math.max(a.x, b.x), y1 = Math.max(a.y, b.y);
+  const x2 = Math.min(a.x + a.w, b.x + b.w), y2 = Math.min(a.y + a.h, b.y + b.h);
+  const i = Math.max(0, x2 - x1) * Math.max(0, y2 - y1);
+  return i / (a.w * a.h + b.w * b.h - i);
+}
+function updateTracks(boxes, now) {
+  const free = new Set(tracks);
+  for (const b of boxes) {
+    let best = null, bi = 0.3;
+    for (const t of free) { const v = iou(t, b); if (v > bi) { bi = v; best = t; } }
+    if (best) { free.delete(best); Object.assign(best, { x: b.x, y: b.y, w: b.w, h: b.h, seen: now }); }
+    else tracks.push({ id: nextId++, x: b.x, y: b.y, w: b.w, h: b.h, seen: now, tries: 0, sh: [], ph: [], sku: null, price: null });
+  }
+  tracks = tracks.filter(t => now - t.seen < 800);
+}
+
+/* ---------- what each tag still needs read ---------- */
+function needs(t) {
+  if (!t.sku) return 'sku';
+  if (!t.price && (mode === 'build' || (mode === 'find' && hunt.some(h => h.sku === t.sku)))) return 'price';
+  return null;
+}
+function pickJob(now) {
+  let best = null;
+  for (const t of tracks) {
+    const k = needs(t);
+    if (!k || t.seen !== now || t.tries >= 10) continue;
+    if (!best || t.tries < best.t.tries || (t.tries === best.t.tries && t.w * t.h > best.t.w * best.t.h)) best = { t, k };
+  }
+  return best;
+}
+function onRead(t, k, text) {
+  t.tries++;
+  rawEl.textContent = text.trim() || '(no text)';
+  const v = k === 'sku' ? parseSku(text) : parsePrice(text);
+  const h = k === 'sku' ? t.sh : t.ph;
+  h.push(v); if (h.length > 3) h.shift();
+  const n = h.length;
+  if (v && n >= 2 && h[n - 2] === v) {          // two reads in a row agree
+    if (k === 'sku') { t.sku = v; t.tries = 0; } else t.price = v;
+    settle(t);
+  }
+}
+function settle(t) {
+  const hu = hunt.find(h => h.sku === t.sku);
+  candEl.textContent = t.sku + (t.price ? '  ' + t.price : ''); candEl.classList.add('ok');
+  footEl.textContent = mode === 'find' ? (hu ? 'On your list' : 'Not on your list') : 'Read';
+  if (mode === 'scan' && !scans.some(s => s.sku === t.sku)) { addScan(t.sku); ping(); }
+  if (mode === 'build' && t.price) { addHunt({ sku: t.sku, price: t.price, done: false }); ping(); }
+  if (mode === 'find' && hu && t.price && +t.price === +hu.price && !hu.done) { hu.done = true; saveHunt(); renderHunt(); ping(); }
+}
+
+/* ---------- box labels ---------- */
+function labelFor(t) {
+  if (!t.sku) return { text: '\u2026', col: '#9aa4b2', dark: true };
+  const hu = hunt.find(h => h.sku === t.sku);
+  if (mode === 'build') return { text: t.sku + (t.price ? '  ' + t.price : ' \u2026'), col: t.price ? '#1a9d57' : '#ffe14a', dark: !t.price };
+  if (mode === 'find') {
+    if (!hu) return { text: t.sku, col: '#9aa4b2', dark: true };
+    if (!t.price) return { text: t.sku + ' \u2026', col: '#ffe14a', dark: true };
+    return +t.price === +hu.price ? { text: t.sku + '  done \u2713', col: '#1a9d57' }
+      : { text: t.sku + '  SWAP ' + t.price + '\u2192' + hu.price, col: '#d7262e' };
+  }
+  return { text: t.sku, col: '#1a9d57' };
+}
+function draw(now) {
   if (overlay.width !== video.videoWidth || overlay.height !== video.videoHeight) {
     overlay.width = video.videoWidth; overlay.height = video.videoHeight;
   }
   octx.clearRect(0, 0, overlay.width, overlay.height);
-  if (!tag || whole) return;
-  const lw = Math.max(3, overlay.width / 180);
-  const good = Date.now() < flashUntil;
-  octx.lineWidth = lw;
-  octx.strokeStyle = good ? '#1a9d57' : '#ffe14a';
-  octx.strokeRect(tag.x, tag.y, tag.w, tag.h);
-  octx.setLineDash([lw * 2.5, lw * 1.5]);
-  octx.strokeStyle = good ? '#1a9d57' : '#ffffff';
-  octx.strokeRect(tag.x + tag.w * REGION.x0, tag.y + tag.h * REGION.y0,
-                  tag.w * (REGION.x1 - REGION.x0), tag.h * (REGION.y1 - REGION.y0));
-  octx.setLineDash([]);
+  const lw = Math.max(3, overlay.width / 180), fs = Math.max(18, overlay.width / 28);
+  octx.font = '700 ' + fs + 'px ui-monospace, Menlo, monospace'; octx.textBaseline = 'bottom';
+  for (const t of tracks) {
+    if (now - t.seen > 300) continue;
+    const L = labelFor(t);
+    octx.lineWidth = lw; octx.strokeStyle = L.col; octx.strokeRect(t.x, t.y, t.w, t.h);
+    const tw = octx.measureText(L.text).width + 12, ty = t.y > fs + 8 ? t.y : t.y + t.h + fs + 8;
+    octx.fillStyle = L.col; octx.fillRect(t.x, ty - fs - 8, tw, fs + 8);
+    octx.fillStyle = L.dark ? '#1d2530' : '#ffffff';
+    octx.fillText(L.text, t.x + 6, ty - 4);
+  }
 }
 
+/* ---------- live camera loop ---------- */
 async function tick() {
   if (!running) return;
   try {
     if (video.readyState >= 2 && video.videoWidth) {
       if (frame.width !== video.videoWidth) { frame.width = video.videoWidth; frame.height = video.videoHeight; }
       frameCtx.drawImage(video, 0, 0);
-      const whole = wholeChk.checked;
-      const tag = whole ? { x: 0, y: 0, w: frame.width, h: frame.height } : detectTag(frame);
-      drawOverlay(tag, whole);
-      const now = Date.now();
-      if (tag) {
-        lastTagSeen = now;
-        if (!ready) setStatus('Loading the text reader\u2026');
-        else {
-          setStatus(whole ? 'Reading the whole frame\u2026' : 'Tag found, reading\u2026');
-          if (!busy && now - lastOcr > 300) {
-            busy = true; lastOcr = now;
-            runOcr(tag, whole).then(onText).catch(e => console.error(e)).finally(() => { busy = false; });
-          }
-        }
-      } else {
-        if (ready) setStatus('Looking for a tag\u2026');
-        if (now - lastTagSeen > 1500) {
-          hist = []; lastAccepted = null;
-          if (now > flashUntil) { candEl.textContent = '\u2014'; candEl.classList.remove('ok'); footEl.textContent = 'Waiting for a tag'; }
+      const boxes = await findTags(frame), now = Date.now();
+      updateTracks(boxes, now); draw(now);
+      if (detState === 'loading') setStatus('Loading the tag finder\u2026');
+      else if (!ready) setStatus('Loading the text reader\u2026');
+      else {
+        setStatus(boxes.length ? HINT[mode] : 'Looking for a tag\u2026');
+        const job = busy ? null : pickJob(now);
+        if (job) {
+          busy = true;
+          runOcr(job.t, job.k).then(x => onRead(job.t, job.k, x)).catch(e => console.error(e)).finally(() => { busy = false; });
         }
       }
     }
   } catch (e) { console.error(e); }
-  setTimeout(tick, 120);
+  setTimeout(tick, 60);
 }
 
 async function startCamera() {
@@ -354,6 +492,7 @@ async function startCamera() {
   }
   startBtn.disabled = true;
   initOcr();
+  initDetector();
   try {
     stream = await navigator.mediaDevices.getUserMedia({
       video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
@@ -384,7 +523,7 @@ function stopCamera() {
   running = false;
   if (stream) stream.getTracks().forEach(t => t.stop());
   stream = null; track = null; video.srcObject = null;
-  octx.clearRect(0, 0, overlay.width, overlay.height);
+  tracks = []; octx.clearRect(0, 0, overlay.width, overlay.height);
   $('placeholder').hidden = false; torchBtn.hidden = true; torchOn = false;
   startBtn.textContent = 'Start camera'; setStatus('Camera stopped.');
 }
@@ -393,33 +532,6 @@ startBtn.onclick = () => (running ? stopCamera() : startCamera());
 torchBtn.onclick = async () => {
   try { torchOn = !torchOn; await track.applyConstraints({ advanced: [{ torch: torchOn }] }); }
   catch (e) { torchOn = false; }
-};
-
-/* ---------- scan a still photo ---------- */
-photoBtn.onclick = () => photoIn.click();
-photoIn.onchange = async () => {
-  const file = photoIn.files[0]; photoIn.value = '';
-  if (!file) return;
-  setStatus('Reading photo\u2026');
-  await initOcr();
-  if (!ready) return;
-  try {
-    const img = new Image();
-    img.src = URL.createObjectURL(file);
-    await img.decode();
-    const k = Math.min(1, 2200 / Math.max(img.naturalWidth, img.naturalHeight));
-    frame.width = Math.round(img.naturalWidth * k); frame.height = Math.round(img.naturalHeight * k);
-    frameCtx.drawImage(img, 0, 0, frame.width, frame.height);
-    URL.revokeObjectURL(img.src);
-    let tag = wholeChk.checked ? null : detectTag(frame);
-    const whole = !tag;
-    if (whole) tag = { x: 0, y: 0, w: frame.width, h: frame.height };
-    const text = await runOcr(tag, whole);
-    rawEl.textContent = text.trim() || '(no text)';
-    const sku = parseSku(text);
-    if (sku) { accept(sku); setStatus('Read ' + sku + ' from the photo.'); }
-    else setStatus(whole ? 'No SKU found in the photo.' : 'Tag found but no SKU read. Try a closer, sharper photo.');
-  } catch (e) { console.error(e); setStatus('Could not read that photo.'); }
 };
 
 /* ---------- list ---------- */
@@ -472,7 +584,42 @@ $('csvBtn').onclick = () => {
 };
 $('clearBtn').onclick = () => { if (scans.length && confirm('Remove all ' + scans.length + ' scans?')) { scans = []; save(); render(); } };
 
-load(); render();
+/* ---------- hunt list ---------- */
+function loadHunt() { try { hunt = JSON.parse(localStorage.getItem('skuHunt') || '[]'); } catch (e) { hunt = []; } }
+function saveHunt() { try { localStorage.setItem('skuHunt', JSON.stringify(hunt)); } catch (e) {} }
+function addHunt(it) {
+  const old = hunt.find(h => h.sku === it.sku);
+  if (old) { old.price = it.price; old.done = false; } else hunt.push(it);
+  saveHunt(); renderHunt();
+}
+function renderHunt() {
+  huntEl.textContent = '';
+  const done = hunt.filter(h => h.done).length;
+  huntCount.textContent = hunt.length ? '(' + done + ' of ' + hunt.length + ' done)' : '';
+  if (!hunt.length) {
+    const li = document.createElement('li'); li.className = 'empty';
+    li.textContent = 'Choose Build list, then scan the new labels.'; huntEl.appendChild(li); return;
+  }
+  hunt.forEach((h, i) => {
+    const li = document.createElement('li');
+    const b = document.createElement('button'); b.className = 'sku';
+    b.textContent = h.sku + '  ' + h.price + (h.done ? '  \u2713' : '');
+    b.style.opacity = h.done ? 0.5 : 1; b.title = 'Tap to mark done or not done';
+    b.onclick = () => { h.done = !h.done; saveHunt(); renderHunt(); };
+    const del = document.createElement('button'); del.className = 'del'; del.textContent = '\u00d7';
+    del.setAttribute('aria-label', 'Remove ' + h.sku);
+    del.onclick = () => { hunt.splice(i, 1); saveHunt(); renderHunt(); };
+    li.append(b, del); huntEl.appendChild(li);
+  });
+}
+$('huntClear').onclick = () => { if (hunt.length && confirm('Clear the hunt list?')) { hunt = []; saveHunt(); renderHunt(); } };
+document.querySelectorAll('#modes button').forEach(b => b.onclick = () => {
+  mode = b.dataset.mode;
+  document.querySelectorAll('#modes button').forEach(x => x.classList.toggle('on', x === b));
+  tracks.forEach(t => { t.price = null; t.ph = []; t.tries = 0; });
+});
+
+load(); loadHunt(); render(); renderHunt();
 })();
 </script>
 </body>
