@@ -157,8 +157,9 @@ const startBtn = $('startBtn'), torchBtn = $('torchBtn');
 const searchEl = $('q'), photoBtn = $('photoBtn'), photoIn = $('photoIn');
 const listEl = $('list'), countEl = $('count'), huntEl = $('huntList'), huntCount = $('huntCount');
 
-// Where the SKU sits inside the tag, as fractions of the tag box (lower-left corner).
-const REGION = { x0: 0.00, x1: 0.52, y0: 0.62, y1: 1.00 };
+// Where the SKU sits inside the tag, as fractions of the tag box.
+// Broader crop makes direct front-of-camera labels work much more reliably.
+const REGION = { x0: 0.00, x1: 0.90, y0: 0.18, y1: 1.00 };
 // SKU format: 4 digits, hyphen, 3 digits.
 const STRICT = /(?:^|\D)(\d{4})\s*[-\u2013\u2014~]\s*(\d{3})(?!\d)/;
 const LOOSE  = /(?:^|\D)(\d{4})[ \t]+(\d{3})(?!\d)/;   // OCR dropped the hyphen
@@ -226,8 +227,8 @@ function setStatus(s) { if (s !== lastStatus) { statusEl.textContent = s; lastSt
 /* ---------- tag detection: YOLO via ONNX Runtime Web ---------- */
 const MODEL_URL = 'best.onnx';   // the exported model, next to index.html
 let MODEL_SIZE = 640;            // fixed automatically if the model expects another size
-let CONF_MIN = 0.85;             // only accept detections at 85% or higher (Settings slider)
-try { CONF_MIN = +localStorage.getItem('skuConf') || 0.85; } catch (e) {}
+let CONF_MIN = 0.55;             // allow lower-confidence tags so direct labels still get picked up
+try { CONF_MIN = +localStorage.getItem('skuConf') || 0.55; } catch (e) {}
 const TAG_CLASS = null;          // set to a class number to ignore the other classes
 let inBuf = null, session = null, inputName = '', detState = 'idle', detPromise = null;
 const lb = document.createElement('canvas'); lb.width = lb.height = MODEL_SIZE;
@@ -411,8 +412,9 @@ function detectTags(src) {
       if (y < h - 1 && m2[k + w] && !seen[k + w]) { seen[k + w] = 1; stack[sp++] = k + w; }
     }
     const bw = maxX - minX + 1, bh = maxY - minY + 1, area = bw * bh, ar = bw / bh;
-    if (area < n * 0.04 || ar < 1.25 || ar > 2.8) continue;
-    if (cnt / area > 0.5) continue;
+    // Allow more realistic label shapes so a directly held tag is not rejected.
+    if (area < n * 0.01 || ar < 0.5 || ar > 4.0) continue;
+    if (cnt / area > 0.7) continue;
     let sum = 0, c = 0;
     for (let y = minY + 3; y < maxY - 3; y += 3) for (let x = minX + 3; x < maxX - 3; x += 3) {
       const p = (y * w + x) * 4;
