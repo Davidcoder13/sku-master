@@ -1,0 +1,546 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SKU scanner - step 5</title>
+<style>
+  :root {
+    --bg: #f5f5f2;
+    --panel: #ffffff;
+    --ink: #151515;
+    --muted: #5a4d46;
+    --red: #d92b2b;
+    --red-soft: #ffe3e3;
+    --yellow: #f4cf3d;
+    --yellow-soft: #fff3c4;
+    --shadow: 0 14px 28px rgba(18, 18, 18, 0.08);
+    --ring: rgba(217, 43, 43, 0.22);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: linear-gradient(180deg, #f9f9f7 0%, #efece7 100%);
+    color: var(--ink);
+    font: 14px system-ui, sans-serif;
+  }
+  #wrap {
+    position: relative;
+    width: min(1100px, calc(100% - 20px));
+    margin: 14px auto 0;
+    padding: 10px;
+    background: var(--panel);
+    border: 2px solid var(--red);
+    border-radius: 18px;
+    box-shadow: var(--shadow);
+  }
+  video, #c {
+    display: block;
+    width: 100%;
+    height: auto;
+    border-radius: 12px;
+  }
+  #c {
+    position: absolute;
+    left: 10px;
+    top: 10px;
+    border: 2px solid rgba(217, 43, 43, 0.7);
+    pointer-events: none;
+    box-shadow: inset 0 0 0 1px rgba(255,255,255,0.45);
+  }
+  #bar {
+    position: sticky;
+    top: 0;
+    z-index: 20;
+    padding: 12px 16px;
+    display: flex;
+    gap: 12px;
+    align-items: center;
+    flex-wrap: wrap;
+    background: rgba(255, 255, 255, 0.96);
+    backdrop-filter: blur(6px);
+    border-bottom: 3px solid var(--red);
+    box-shadow: 0 8px 18px rgba(17, 17, 17, 0.05);
+  }
+  button {
+    border: 2px solid var(--red);
+    background: linear-gradient(180deg, #fff7f7 0%, #ffe8a6 100%);
+    color: var(--ink);
+    font-size: 16px;
+    font-weight: 700;
+    padding: 10px 16px;
+    border-radius: 12px;
+    cursor: pointer;
+    transition: transform 0.15s ease, box-shadow 0.15s ease, border-color 0.15s ease;
+    box-shadow: 0 6px 14px rgba(217, 43, 43, 0.12);
+  }
+  button:hover { transform: translateY(-1px); }
+  button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+  }
+  #q {
+    font-size: 16px;
+    padding: 11px 14px;
+    flex: 1;
+    min-width: 180px;
+    border: 2px solid var(--red);
+    border-radius: 12px;
+    background: #fffaf0;
+    color: var(--ink);
+    outline: none;
+    box-shadow: inset 0 1px 2px rgba(0,0,0,0.04);
+  }
+  #q:focus {
+    border-color: #be2222;
+    box-shadow: 0 0 0 4px var(--ring);
+    background: #fffdf7;
+  }
+  #stat {
+    padding: 8px 12px;
+    border-radius: 999px;
+    border: 1px solid rgba(217, 43, 43, 0.35);
+    background: var(--yellow-soft);
+    color: #6d4b11;
+    font-weight: 700;
+  }
+  #list {
+    max-width: 1100px;
+    margin: 16px auto 0;
+    padding: 0 10px;
+    display: grid;
+    gap: 10px;
+  }
+  #list div {
+    padding: 12px 14px;
+    border: 2px solid var(--red);
+    border-radius: 12px;
+    background: linear-gradient(180deg, #ffffff 0%, #fffaf0 100%);
+    font-size: 17px;
+    box-shadow: 0 8px 18px rgba(26, 26, 26, 0.04);
+    color: var(--ink);
+  }
+  #list .hit {
+    background: linear-gradient(180deg, #fff4b4 0%, #ffe68a 100%);
+    border-color: #d89a00;
+  }
+  #crops {
+    max-width: 1100px;
+    margin: 16px auto 24px;
+    padding: 0 10px;
+    display: grid;
+    gap: 12px;
+  }
+  .row {
+    display: flex;
+    gap: 12px;
+    align-items: flex-start;
+    padding: 12px;
+    border: 2px solid var(--red);
+    border-radius: 16px;
+    background: #fff;
+    box-shadow: 0 8px 18px rgba(24, 24, 24, 0.04);
+  }
+  .row .tag {
+    width: 34%;
+    max-width: 320px;
+    height: auto;
+    border: 2px solid var(--red);
+    border-radius: 12px;
+    background: #fffaf3;
+    box-shadow: inset 0 0 0 1px rgba(217, 43, 43, 0.15);
+  }
+  .col {
+    width: 66%;
+    min-width: 0;
+  }
+  .col canvas {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin-bottom: 6px;
+    border: 1px solid rgba(217, 43, 43, 0.35);
+    border-radius: 10px;
+    background: #fff;
+  }
+  .strip { image-rendering: pixelated; }
+  .cap {
+    font-size: 12px;
+    color: #352d2a;
+    word-break: break-all;
+    background: linear-gradient(180deg, #fff6d6 0%, #fff1c5 100%);
+    border: 1px solid rgba(217, 43, 43, 0.28);
+    border-radius: 10px;
+    padding: 8px 10px;
+    line-height: 1.45;
+  }
+</style>
+</head>
+<body>
+<div id="bar"><button id="go">Start</button><input id="q" placeholder="search SKU, e.g. 1852-508 or 508" inputmode="text" autocomplete="off"><button id="log">Copy log</button><span id="stat">idle</span></div>
+<div id="wrap"><video id="v" playsinline muted></video><canvas id="c"></canvas></div>
+<div id="list"></div>
+<div id="crops"></div>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/ort.webgpu.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5.1.1/dist/tesseract.min.js"></script>
+<script>
+const DET_CONF = 0.25, NEW_CONF = 0.4, MAX_MISS = 4;
+const STRIP = {x0: -0.03, y0: 0.45, x1: 0.6, y1: 1.0}; // SKU region as fractions of the upright tag
+const K = 2, STACK = 8, R = 4, STEP = 4, MAX_COST = 45; // layering: upscale, frames kept, shift search, sample step
+ort.env.wasm.wasmPaths = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.19.2/dist/';
+const $ = id => document.getElementById(id);
+const v = $('v'), c = $('c'), ctx = c.getContext('2d'), stat = $('stat');
+const pre = document.createElement('canvas'), pctx = pre.getContext('2d', {willReadFrequently: true});
+let session, tess, ocrBusy = false, provider = '?', W, H, n = 0, detMs = 0, tracks = [], nextId = 1, ov = 1;
+const rows = new Map();
+let selId = null, query = '';
+const history = [], LOG_HEAD = 'time,tag_id,sku_confirmed,partial,strip_px,frames,valid_reads_by_candidate';
+const csvLine = t => [new Date().toISOString(), t.id, t.sku || '', t.partial || '', `${t.sw || 0}x${t.sh || 0}`, t.bank.length, JSON.stringify(t.hit).replace(/["{}]/g, '').replace(/,/g, ';')].join(',');
+const norm = s => s.replace(/[^0-9?]/g, '');
+function matches(t, q) { // '?' in a partial read matches any digit, so unfinished reads can still be found
+  q = norm(q); const p = norm(t.partial || ''); if (!q || !p) return false;
+  for (let i = 0; i + q.length <= p.length; i++) if ([...q].every((ch, j) => ch === '?' || p[i + j] === '?' || p[i + j] === ch)) return true;
+  return false;
+}
+function markHl() {
+  if (selId !== null && !tracks.some(t => t.id === selId)) selId = null;
+  for (const t of tracks) t.hl = t.id === selId || matches(t, query);
+}
+function renderList() {
+  const L = $('list');
+  L.replaceChildren();
+  const ts = tracks.filter(t => t.hits >= 2).sort((a, b) => {
+    if (a.sku && !b.sku) return -1;
+    if (!a.sku && b.sku) return 1;
+    if (a.partial && !b.partial) return -1;
+    if (!a.partial && b.partial) return 1;
+    return b.w - a.w;
+  });
+  for (const t of ts) {
+    const d = document.createElement('div');
+    d.textContent = `#${t.id}  ` + (t.sku ? t.sku : t.partial ? t.partial + '  (partial)' : t.tooFar ? 'too far - move closer' : 'reading...');
+    if (t.hl) d.className = 'hit';
+    d.onclick = () => {
+      selId = selId === t.id ? null : t.id;
+      markHl();
+      renderList();
+    };
+    L.appendChild(d);
+  }
+  if (!ts.length) {
+    const empty = document.createElement('div');
+    empty.textContent = 'No tags yet';
+    empty.style.opacity = '0.7';
+    L.appendChild(empty);
+  }
+}
+$('q').oninput = e => {
+  query = e.target.value;
+  markHl();
+  renderList();
+};
+$('log').onclick = async () => {
+  const text = [LOG_HEAD, ...history, ...tracks.filter(t => t.hits >= 2).map(csvLine)].join('\n');
+  try { await navigator.clipboard.writeText(text); stat.textContent = 'log copied to clipboard'; }
+  catch (e) { const ta = document.createElement('textarea'); ta.value = text; ta.style.width = '100%'; ta.rows = 8; $('list').prepend(ta); ta.select(); }
+};
+
+$('go').onclick = async () => {
+  $('go').disabled = true;
+  try {
+    stat.textContent = 'starting camera...';
+    v.srcObject = await navigator.mediaDevices.getUserMedia(
+      {video: {facingMode: 'environment', width: {ideal: 3840}, height: {ideal: 2160}}, audio: false});
+    await v.play();
+    ov = Math.min(1, 1280 / Math.max(v.videoWidth, v.videoHeight));
+    c.width = Math.round(v.videoWidth * ov); c.height = Math.round(v.videoHeight * ov);
+    const portrait = v.videoHeight > v.videoWidth;
+    const file = portrait ? 'best_portrait.onnx' : 'best_landscape.onnx';
+    W = portrait ? 576 : 1024; H = portrait ? 1024 : 576;
+    pre.width = W; pre.height = H;
+    stat.textContent = 'loading OCR...';
+    tess = await Tesseract.createWorker('eng');
+    await tess.setParameters({tessedit_char_whitelist: '0123456789-', tessedit_pageseg_mode: '6'});
+    stat.textContent = 'loading ' + file + '...';
+    try { session = await ort.InferenceSession.create(file, {executionProviders: ['webgpu']}); provider = 'WebGPU'; }
+    catch (e) { session = await ort.InferenceSession.create(file, {executionProviders: ['wasm']}); provider = 'WASM'; }
+    loop();
+  } catch (e) { stat.textContent = 'error: ' + e.message; $('go').disabled = false; }
+};
+
+function preprocess() {
+  const vw = v.videoWidth, vh = v.videoHeight, s = Math.min(W / vw, H / vh);
+  const w = vw * s, h = vh * s, dx = (W - w) / 2, dy = (H - h) / 2;
+  pctx.fillStyle = 'rgb(114,114,114)'; pctx.fillRect(0, 0, W, H);
+  pctx.drawImage(v, dx, dy, w, h);
+  const px = pctx.getImageData(0, 0, W, H).data, P = W * H, f = new Float32Array(3 * P);
+  for (let i = 0; i < P; i++) {
+    f[i] = px[i * 4] / 255; f[P + i] = px[i * 4 + 1] / 255; f[2 * P + i] = px[i * 4 + 2] / 255;
+  }
+  return {tensor: new ort.Tensor('float32', f, [1, 3, H, W]), s, dx, dy};
+}
+
+// output0 is [1,6,N]: rows = cx, cy, w, h, score, angle(rad), in model-input pixels. Returns video-pixel boxes.
+function decode(d, N, p) {
+  const out = [];
+  for (let i = 0; i < N; i++) {
+    const sc = d[4 * N + i];
+    if (sc > DET_CONF) out.push({cx: (d[i] - p.dx) / p.s, cy: (d[N + i] - p.dy) / p.s, w: d[2 * N + i] / p.s, h: d[3 * N + i] / p.s, a: d[5 * N + i], sc});
+  }
+  out.sort((x, y) => y.sc - x.sc);
+  const keep = [];
+  for (const b of out) {
+    if (!keep.some(k => {
+      const dx = b.cx - k.cx, dy = b.cy - k.cy, co = Math.cos(k.a), si = Math.sin(k.a);
+      return Math.abs(dx * co + dy * si) < k.w / 2 && Math.abs(-dx * si + dy * co) < k.h / 2;
+    })) keep.push(b);
+  }
+  return keep;
+}
+
+function updateTracks(ds) {
+  const used = new Set();
+  for (const t of tracks) {
+    let best = -1, bd = 1e9;
+    ds.forEach((d, i) => { if (used.has(i)) return; const dist = Math.hypot(d.cx - t.cx, d.cy - t.cy); if (dist < bd) { bd = dist; best = i; } });
+    if (best >= 0 && bd < 0.6 * Math.max(t.w, t.h)) {
+      const d = ds[best]; used.add(best);
+      t.cx += (d.cx - t.cx) * 0.5; t.cy += (d.cy - t.cy) * 0.5;
+      t.w += (d.w - t.w) * 0.3; t.h += (d.h - t.h) * 0.3; t.a += (d.a - t.a) * 0.3;
+      t.sc = d.sc; t.hits++; t.miss = 0;
+    } else t.miss++;
+  }
+  ds.forEach((d, i) => { if (!used.has(i) && d.sc >= NEW_CONF) tracks.push({id: nextId++, ...d, hits: 1, miss: 0, bank: [], pos: Array.from({length: 7}, () => ({})), reads: 0, hit: {}, alt: '', sku: null, partial: '', raw: '', w0: d.w}); });
+  for (const t of tracks) if (t.miss > MAX_MISS && t.hits >= 2 && (t.sku || t.partial)) history.push(csvLine(t));
+  tracks = tracks.filter(t => t.miss <= MAX_MISS);
+}
+const visTracks = () => tracks.filter(t => t.hits >= 2).sort((a, b) => b.w - a.w).slice(0, 4); // read only the 4 biggest (most readable) tags
+
+function corners(b) {
+  const co = Math.cos(b.a), si = Math.sin(b.a);
+  return [[-1, -1], [1, -1], [1, 1], [-1, 1]].map(([sx, sy]) => [
+    (b.cx + sx * b.w / 2 * co - sy * b.h / 2 * si) * ov, (b.cy + sx * b.w / 2 * si + sy * b.h / 2 * co) * ov]);
+}
+
+function renderRegion(oc, b, f, k) {
+  const rw = Math.max(1, Math.round((f.x1 - f.x0) * b.w * k)), rh = Math.max(1, Math.round((f.y1 - f.y0) * b.h * k));
+  if (oc.width !== rw || oc.height !== rh) { oc.width = rw; oc.height = rh; }
+  const o = oc.getContext('2d');
+  o.setTransform(1, 0, 0, 1, 0, 0);
+  o.scale(k, k); o.translate(b.w / 2 - f.x0 * b.w, b.h / 2 - f.y0 * b.h); o.rotate(-b.a); o.translate(-b.cx, -b.cy);
+  o.drawImage(v, 0, 0);
+  return {w: Math.round((f.x1 - f.x0) * b.w), h: Math.round((f.y1 - f.y0) * b.h)};
+}
+
+// ---------- STIR: gated frame bank -> sub-pixel registration -> iterative back-projection (S x) ----------
+const S = 2, BANK = 16, ITER = 6, MIN_H = 24, REG = 0.15; // REG: pull toward Lanczos each iteration to limit noise amplification (0 = off) // S: reconstruction factor (try 3 or 4); MIN_H: min strip height (src px) worth trying
+const bil = (g, w, h, x, y) => {
+  x = x < 0 ? 0 : x > w - 1.001 ? w - 1.001 : x; y = y < 0 ? 0 : y > h - 1.001 ? h - 1.001 : y;
+  const x0 = x | 0, y0 = y | 0, fx = x - x0, fy = y - y0, i = y0 * w + x0;
+  return (g[i] * (1 - fx) + g[i + 1] * fx) * (1 - fy) + (g[i + w] * (1 - fx) + g[i + w + 1] * fx) * fy;
+};
+function lrGray(t) { // low-res strip at source pixel density, in the tag's own coordinates
+  if (!t.sw) { t.sw = Math.max(8, Math.round((STRIP.x1 - STRIP.x0) * t.w)); t.sh = Math.max(8, Math.round((STRIP.y1 - STRIP.y0) * t.h));
+    t.cv = document.createElement('canvas'); t.cv.width = t.sw; t.cv.height = t.sh; }
+  const kx = t.sw / ((STRIP.x1 - STRIP.x0) * t.w), ky = t.sh / ((STRIP.y1 - STRIP.y0) * t.h);
+  const o = t.cv.getContext('2d', {willReadFrequently: true});
+  o.setTransform(1, 0, 0, 1, 0, 0); o.clearRect(0, 0, t.sw, t.sh); o.imageSmoothingQuality = 'high';
+  o.scale(kx, ky); o.translate(t.w / 2 - STRIP.x0 * t.w, t.h / 2 - STRIP.y0 * t.h); o.rotate(-t.a); o.translate(-t.cx, -t.cy);
+  o.drawImage(v, 0, 0);
+  const d = o.getImageData(0, 0, t.sw, t.sh).data, g = new Float32Array(t.sw * t.sh);
+  for (let i = 0; i < g.length; i++) g[i] = 0.299 * d[4 * i] + 0.587 * d[4 * i + 1] + 0.114 * d[4 * i + 2];
+  return g;
+}
+function quality(g, w, h) {
+  const N = w * h; let s = 0, m = 0, lo = 0, hi = 0;
+  for (let i = 0; i < N; i++) { m += g[i]; if (g[i] < 8) lo++; else if (g[i] > 247) hi++; }
+  for (let y = 0; y < h - 1; y++) for (let x = 0; x < w - 1; x++) { const i = y * w + x, a = g[i + 1] - g[i], b = g[i + w] - g[i]; s += a * a + b * b; }
+  return {sharp: s / N, mean: m / N, lo: lo / N, hi: hi / N};
+}
+function register(ref, g, w, h) { // integer search, then Lucas-Kanade refinement -> fractional (dx,dy): g(p) ~ ref(p - d)
+  let bc = 1e18, dx = 0, dy = 0;
+  for (let j = -3; j <= 3; j++) for (let i = -3; i <= 3; i++) {
+    let s = 0, c = 0;
+    for (let y = 4; y < h - 4; y += 2) for (let x = 4; x < w - 4; x += 2) { s += Math.abs(ref[y * w + x] - g[(y + j) * w + x + i]); c++; }
+    s /= c; if (s < bc) { bc = s; dx = i; dy = j; }
+  }
+  for (let it = 0; it < 5; it++) {
+    let a = 0, b = 0, c2 = 0, e1 = 0, e2 = 0;
+    for (let y = 3; y < h - 3; y++) for (let x = 3; x < w - 3; x++) {
+      const Ix = (bil(g, w, h, x + dx + 1, y + dy) - bil(g, w, h, x + dx - 1, y + dy)) / 2, Iy = (bil(g, w, h, x + dx, y + dy + 1) - bil(g, w, h, x + dx, y + dy - 1)) / 2;
+      const e = ref[y * w + x] - bil(g, w, h, x + dx, y + dy);
+      a += Ix * Ix; b += Ix * Iy; c2 += Iy * Iy; e1 += Ix * e; e2 += Iy * e;
+    }
+    const det = a * c2 - b * b; if (det < 1e-3) break;
+    const ux = (c2 * e1 - b * e2) / det, uy = (a * e2 - b * e1) / det; dx += ux; dy += uy;
+    if (Math.abs(ux) + Math.abs(uy) < 0.01) break;
+  }
+  return {dx, dy, cost: bc};
+}
+const fr = x => x - Math.round(x);
+function stackStep(t) {
+  if (t.sw && Math.abs(t.w - t.w0) / t.w0 > 0.25) { t.sw = 0; t.bank = []; t.ref = null; t.w0 = t.w; }
+  const g = lrGray(t), w = t.sw, h = t.sh;
+  t.tooFar = h < MIN_H; if (t.tooFar) return;
+  const q = quality(g, w, h);
+  if (q.mean < 40 || q.mean > 235 || q.hi > 0.6 || q.lo > 0.6) { t.rej = 'exposure'; return; }
+  if (!t.ref) { t.ref = g; t.best = q.sharp; t.bank = [{g, dx: 0, dy: 0, q: q.sharp}]; return; }
+  if (q.sharp < 0.6 * t.best) { t.rej = 'blur'; return; }
+  const r = register(t.ref, g, w, h);
+  if (r.cost > 45) { t.rej = 'mismatch'; return; }
+  const nf = {g, dx: r.dx, dy: r.dy, q: q.sharp};
+  const di = t.bank.findIndex(f => Math.hypot(fr(f.dx - r.dx), fr(f.dy - r.dy)) < 0.1); // same sub-pixel phase = no new information
+  if (di >= 0) { if (di > 0 && q.sharp > t.bank[di].q * 1.1) t.bank[di] = nf; else { t.rej = 'duplicate'; return; } }
+  else { t.bank.push(nf); if (t.bank.length > BANK) { let wi = 1; for (let i = 1; i < t.bank.length; i++) if (t.bank[i].q < t.bank[wi].q) wi = i; t.bank.splice(wi, 1); } }
+  t.best = Math.max(t.best, q.sharp); t.rej = '';
+  if (t.bank.length >= 3) reconstruct(t);
+}
+function blur3(g, w, h) {
+  const o = new Float32Array(g.length);
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    let s = 0, c = 0;
+    for (let j = -1; j <= 1; j++) for (let i = -1; i <= 1; i++) { const xx = x + i, yy = y + j;
+      if (xx >= 0 && yy >= 0 && xx < w && yy < h) { const k = (2 - Math.abs(i)) * (2 - Math.abs(j)); s += g[yy * w + xx] * k; c += k; } }
+    o[y * w + x] = s / c;
+  }
+  return o;
+}
+function lanczos(g, w, h) {
+  const L = x => x === 0 ? 1 : Math.abs(x) >= 3 ? 0 : 3 * Math.sin(Math.PI * x) * Math.sin(Math.PI * x / 3) / (Math.PI * Math.PI * x * x);
+  const W2 = w * S, H2 = h * S, tmp = new Float32Array(W2 * h), out = new Float32Array(W2 * H2);
+  for (let y = 0; y < h; y++) for (let X = 0; X < W2; X++) { const sx = (X + 0.5) / S - 0.5, x0 = Math.floor(sx); let s = 0, ws = 0;
+    for (let k = -2; k <= 3; k++) { const xi = x0 + k, wt = L(sx - xi); s += g[y * w + Math.min(w - 1, Math.max(0, xi))] * wt; ws += wt; } tmp[y * W2 + X] = s / ws; }
+  for (let Y = 0; Y < H2; Y++) { const sy = (Y + 0.5) / S - 0.5, y0 = Math.floor(sy);
+    for (let x = 0; x < W2; x++) { let s = 0, ws = 0;
+      for (let k = -2; k <= 3; k++) { const yi = y0 + k, wt = L(sy - yi); s += tmp[Math.min(h - 1, Math.max(0, yi)) * W2 + x] * wt; ws += wt; } out[Y * W2 + x] = s / ws; } }
+  return out;
+}
+function stretch(g) {
+  const N = g.length, hist = new Uint32Array(256), o = new Float32Array(N);
+  for (let i = 0; i < N; i++) hist[Math.max(0, Math.min(255, g[i] | 0))]++;
+  let acc = 0, lo = 0, hi = 255;
+  for (let k = 0; k < 256; k++) { acc += hist[k]; if (acc >= N * 0.02) { lo = k; break; } }
+  acc = 0; for (let k = 255; k >= 0; k--) { acc += hist[k]; if (acc >= N * 0.02) { hi = k; break; } }
+  const s = 255 / Math.max(1, hi - lo);
+  for (let i = 0; i < N; i++) o[i] = Math.max(0, Math.min(255, (g[i] - lo) * s));
+  return o;
+}
+function unsharp(g, w, h, a) { const b = blur3(g, w, h), o = new Float32Array(g.length); for (let i = 0; i < o.length; i++) o[i] = Math.max(0, Math.min(255, g[i] + a * (g[i] - b[i]))); return o; }
+function adaptive(g, w, h) {
+  const R = 10, I = new Float64Array((w + 1) * (h + 1)), o = new Float32Array(g.length);
+  for (let y = 0; y < h; y++) { let row = 0; for (let x = 0; x < w; x++) { row += g[y * w + x]; I[(y + 1) * (w + 1) + x + 1] = I[y * (w + 1) + x + 1] + row; } }
+  for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+    const x0 = Math.max(0, x - R), x1 = Math.min(w, x + R + 1), y0 = Math.max(0, y - R), y1 = Math.min(h, y + R + 1);
+    const m = (I[y1 * (w + 1) + x1] - I[y0 * (w + 1) + x1] - I[y1 * (w + 1) + x0] + I[y0 * (w + 1) + x0]) / ((x1 - x0) * (y1 - y0));
+    o[y * w + x] = g[y * w + x] < m * 0.9 ? 0 : 255;
+  }
+  return o;
+}
+function putGray(cv, g, w, h) {
+  const id = new ImageData(w, h);
+  for (let i = 0; i < w * h; i++) { const q = Math.max(0, Math.min(255, g[i])); id.data[4 * i] = id.data[4 * i + 1] = id.data[4 * i + 2] = q; id.data[4 * i + 3] = 255; }
+  cv.getContext('2d').putImageData(id, 0, 0);
+}
+function grayCanvas(g, w, h) { const cv = document.createElement('canvas'); cv.width = w; cv.height = h; putGray(cv, g, w, h); return cv; }
+
+// iterative back-projection: simulate each observed frame from the HR estimate, push the error back
+function reconstruct(t) {
+  const w = t.sw, h = t.sh, W2 = w * S, H2 = h * S, N2 = W2 * H2, lan = lanczos(t.ref, w, h), hr = Float32Array.from(lan);
+  for (let it = 0; it < ITER; it++) {
+    const hb = blur3(hr, W2, H2), corr = new Float32Array(N2), ws = new Float32Array(N2);
+    for (const f of t.bank) for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const hx = (x - f.dx + 0.5) * S - 0.5, hy = (y - f.dy + 0.5) * S - 0.5;
+      if (hx < 0 || hy < 0 || hx > W2 - 1.001 || hy > H2 - 1.001) continue;
+      const e = f.g[y * w + x] - bil(hb, W2, H2, hx, hy), x0 = hx | 0, y0 = hy | 0, fx = hx - x0, fy = hy - y0, i = y0 * W2 + x0;
+      corr[i] += e * (1 - fx) * (1 - fy); ws[i] += (1 - fx) * (1 - fy);
+      corr[i + 1] += e * fx * (1 - fy); ws[i + 1] += fx * (1 - fy);
+      corr[i + W2] += e * (1 - fx) * fy; ws[i + W2] += (1 - fx) * fy;
+      corr[i + W2 + 1] += e * fx * fy; ws[i + W2 + 1] += fx * fy;
+    }
+    for (let i = 0; i < N2; i++) if (ws[i] > 0.05) hr[i] = Math.max(0, Math.min(255, hr[i] + 0.8 * corr[i] / ws[i] - REG * (hr[i] - lan[i])));
+  }
+  t.shL = quality(lan, W2, H2).sharp.toFixed(0); t.shS = quality(hr, W2, H2).sharp.toFixed(0);
+  if (!t.cmp) t.cmp = [0, 1, 2].map(() => { const cv = document.createElement('canvas'); cv.width = W2; cv.height = H2; return cv; });
+  const b0 = t.cmp[0].getContext('2d'); b0.imageSmoothingQuality = 'high'; b0.drawImage(grayCanvas(t.ref, w, h), 0, 0, W2, H2); // canvas bicubic-style upscale
+  putGray(t.cmp[1], lan, W2, H2); putGray(t.cmp[2], hr, W2, H2);
+  const st = stretch(lan);
+  t.cands = [['gray', lan], ['contrast', st], ['sharpened', unsharp(st, W2, H2, 0.8)], ['adaptive', adaptive(st, W2, H2)], ['stir', hr], ['stir+enh', unsharp(stretch(hr), W2, H2, 0.8)]];
+  t.dirty = true;
+}
+
+// ---------- OCR ensemble + character-level voting (never guesses: uncertain digits stay '?') ----------
+async function runOcr(t) {
+  ocrBusy = true; t.lo = performance.now();
+  const w = t.sw * S, h = t.sh * S;
+  try {
+    for (const [name, g] of t.cands) {
+      const {data} = await tess.recognize(grayCanvas(g, w, h), {}, {blocks: true});
+      let cs = [];
+      for (const b of data.blocks || []) for (const p of b.paragraphs || []) for (const l of p.lines || []) for (const wd of l.words || []) for (const s of wd.symbols || []) cs.push({c: s.text, conf: (s.confidence ?? 50) / 100});
+      if (!cs.length) cs = [...data.text].map(c => ({c, conf: (data.confidence ?? 50) / 100}));
+      const str = cs.map(x => x.c).join('');
+      t.raw = name + ': ' + str.replace(/\s+/g, ' ').slice(0, 40);
+      for (const m of str.matchAll(/\d{4}-\d{3}/g)) {
+        t.reads++; t.hit[name] = (t.hit[name] || 0) + 1; let k = 0;
+        for (let j = 0; j < 8; j++) { if (j === 4) continue; const d = m[0][j], cf = cs[m.index + j].conf; t.pos[k][d] = (t.pos[k][d] || 0) + cf; k++; }
+      }
+    }
+  } catch (e) { t.raw = 'ocr error ' + e.message; }
+  let s = '', ok = true; const alt = [];
+  t.pos.forEach((p, i) => {
+    const e = Object.entries(p).sort((a, b) => b[1] - a[1]);
+    const good = e.length && e[0][1] >= 1.6 && (e.length < 2 || e[0][1] >= 2.5 * e[1][1]);
+    if (i === 4) s += '-'; s += good ? e[0][0] : '?'; if (!good) { ok = false; alt.push('pos' + (i + 1) + ' ' + e.slice(0, 2).map(x => x[0] + ':' + x[1].toFixed(1)).join(' vs ')); }
+  });
+  t.alt = alt.join(', ');
+  t.partial = s; t.sku = ok ? s : null;
+  if (t.reads > 40) { t.reads = 0; t.pos.forEach(p => { for (const k in p) p[k] *= 0.5; }); }
+  ocrBusy = false;
+}
+
+function draw() {
+  ctx.clearRect(0, 0, c.width, c.height);
+  ctx.lineWidth = Math.max(3, c.width / 300); ctx.font = `bold ${Math.round(c.width / 28)}px sans-serif`;
+  const vis = visTracks(), alive = new Set(vis.map(t => t.id)), base = ctx.lineWidth;
+  for (const t of tracks.filter(t => t.hits >= 2)) {
+    const q = corners(t), col = t.hl ? '#d92b2b' : t.tooFar ? '#9ea3a7' : t.sku ? '#1ea660' : '#f4cf3d';
+    ctx.lineWidth = t.hl ? base * 2.5 : base;
+    ctx.strokeStyle = ctx.fillStyle = col; ctx.beginPath();
+    q.forEach(([x, y], i) => i ? ctx.lineTo(x, y) : ctx.moveTo(x, y));
+    ctx.closePath(); ctx.stroke(); ctx.fillText(t.tooFar ? 'too far' : t.sku || t.partial || '...', q[0][0], q[0][1] - 8);
+    if (!vis.includes(t)) continue;
+    let r = rows.get(t.id);
+    if (!r) {
+      const el = document.createElement('div'); el.className = 'row';
+      const tag = document.createElement('canvas'); tag.className = 'tag';
+      const col2 = document.createElement('div'); col2.className = 'col';
+      const cap = document.createElement('div'); cap.className = 'cap';
+      col2.append(cap); el.append(tag, col2); $('crops').appendChild(el);
+      r = {el, tag, col2, cap, added: false}; rows.set(t.id, r);
+    }
+    if (t.cmp && !r.added) { t.cmp.forEach(cv => r.col2.insertBefore(cv, r.cap)); r.added = true; }
+    renderRegion(r.tag, t, {x0: 0, y0: 0, x1: 1, y1: 1}, 360 / t.w);
+    r.cap.textContent = `#${t.id} ${t.sku ? 'SKU ' + t.sku : t.partial || 'no SKU yet'} | strip ${t.sw}x${t.sh} src px${t.tooFar ? ' - TOO FAR' : ''} | frames ${t.bank.length}/${BANK}${t.rej ? ' (last rejected: ' + t.rej + ')' : ''} | images top to bottom: bicubic, Lanczos, STIR | sharpness Lanczos ${t.shL || '-'} vs STIR ${t.shS || '-'} | valid reads by candidate ${JSON.stringify(t.hit)} | unsure digits: ${t.alt || '-'}`;
+  }
+  for (const [id, r] of rows) if (!alive.has(id)) { r.el.remove(); rows.delete(id); }
+}
+
+async function loop() {
+  if (n++ % 2 === 0) {
+    const t0 = performance.now(), p = preprocess();
+    const res = await session.run({images: p.tensor});
+    updateTracks(decode(res.output0.data, res.output0.dims[2], p));
+    detMs = performance.now() - t0;
+  }
+  const vis = visTracks();
+  markHl(); if (n % 15 === 0) renderList();
+  if (n % 3 === 0) vis.forEach(stackStep);
+  if (!ocrBusy) { const t = vis.filter(t => t.dirty).sort((a, b) => (a.lo || 0) - (b.lo || 0))[0]; if (t) { t.dirty = false; runOcr(t); } }
+  draw();
+  stat.textContent = `${provider} | video ${v.videoWidth}x${v.videoHeight} | ${vis.length} tag(s) | detect ${detMs.toFixed(0)} ms`;
+  requestAnimationFrame(loop);
+}
+</script>
+</body>
+</html>
